@@ -1,0 +1,197 @@
+# Continuous integration for the trade pipeline.
+#
+# Two jobs, deliberately split by whether they need Snowflake at all:
+#
+#   validate          no credentials, cannot reach Snowflake, ~1 minute
+#   dbt-integration   builds every dbt node against a throwaway clone of TRADE_DB
+#
+# This workflow never runs `terraform apply` and never writes to TRADE_DB, so
+# opening a pull request cannot change infrastructure or data. See README
+# section 17 for why Terraform apply stays a local operation.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push to the same branch cancels the previous run rather than queueing
+# a second CI database clone behind it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  TERRAFORM_VERSION: "1.15.8"
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Everything that can be checked without a warehouse.
+  #
+  # The Snowflake variables below are deliberately dummy values. `dbt parse`
+  # needs them to render the env_var() calls in profiles.yml, but it never opens
+  # a connection - so this job is structurally incapable of reaching Snowflake,
+  # which is what makes it safe to run on every push at no cost.
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate (no Snowflake)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert no credentials or state files are tracked
+        run: |
+          tracked=$(git ls-files | grep -E '(^|/)\.env$|(^|/)profiles\.yml$|\.tfstate|(^|/)[^/]*\.tfvars$|\.tfplan$|(^|/)\.terraform/' || true)
+          if [ -n "$tracked" ]; then
+            echo "::error::These files must never be committed:"
+            echo "$tracked"
+            exit 1
+          fi
+          echo "OK - no .env, profiles.yml, tfstate, tfvars or tfplan in the index."
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Python tests
+        run: pytest tests/ -q
+
+      # profiles.yml is gitignored, so CI builds it from the committed example.
+      - name: Create the dbt profile
+        run: cp dbt/profiles.yml.example dbt/profiles.yml
+
+      - name: Validate the dbt project (offline)
+        working-directory: dbt
+        env:
+          SNOWFLAKE_ACCOUNT: ci-parse-only
+          SNOWFLAKE_USER: ci-parse-only
+          SNOWFLAKE_PASSWORD: ci-parse-only
+          SNOWFLAKE_ROLE: ci-parse-only
+          SNOWFLAKE_WAREHOUSE: ci-parse-only
+          SNOWFLAKE_DATABASE: ci-parse-only
+          DBT_TARGET_SCHEMA: BRONZE
+        # `dbt parse` resolves every model, ref, source, macro, generic test and
+        # unit test definition without connecting. `dbt compile` would connect,
+        # so it belongs in the job below rather than here.
+        run: dbt parse --profiles-dir . --no-partial-parse
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        working-directory: terraform
+        run: terraform fmt -check -recursive
+
+      # -backend=false downloads the provider without configuring any backend,
+      # which is what lets validate run with no state and no credentials.
+      - name: terraform validate
+        working-directory: terraform
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+  # ---------------------------------------------------------------------------
+  # Full dbt build against an isolated zero-copy clone of TRADE_DB.
+  #
+  # Cloning is metadata-only, so this costs nothing in storage and takes about a
+  # second. The clone carries whatever RAW holds, which makes this a genuine
+  # integration test - and it passes just as well against an empty RAW, so CI
+  # never depends on anyone having loaded the batch files.
+  #
+  # Isolation needs no code change: models/staging/sources.yml already resolves
+  # its database from SNOWFLAKE_DATABASE, and so does the profile, so pointing
+  # that one variable at the clone moves the source and every model target with
+  # it. TRADE_DB is neither read nor written here.
+  # ---------------------------------------------------------------------------
+  dbt-integration:
+    name: dbt build (isolated clone)
+    runs-on: ubuntu-latest
+    needs: validate
+    # Forks do not receive secrets, so skip rather than fail with a confusing
+    # authentication error.
+    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push'
+
+    env:
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+      SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+      SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+      SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+      # The database CI reads from and clones. Not a credential, but it lives in
+      # secrets alongside the rest of the connection settings.
+      SOURCE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+      # The database dbt actually builds into. github.run_id is unique, so two
+      # pull requests running at once cannot collide.
+      SNOWFLAKE_DATABASE: TRADE_DB_CI_${{ github.run_id }}
+      DBT_TARGET_SCHEMA: BRONZE
+      DBT_THREADS: "4"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Create the dbt profile
+        run: cp dbt/profiles.yml.example dbt/profiles.yml
+
+      - name: Clone TRADE_DB into a throwaway CI database
+        run: |
+          python - <<'PY'
+          import os, snowflake.connector
+          target = os.environ["SNOWFLAKE_DATABASE"]
+          source = os.environ["SOURCE_DATABASE"]
+          connection = snowflake.connector.connect(
+              account=os.environ["SNOWFLAKE_ACCOUNT"],
+              user=os.environ["SNOWFLAKE_USER"],
+              password=os.environ["SNOWFLAKE_PASSWORD"],
+              role=os.environ["SNOWFLAKE_ROLE"],
+              warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
+          )
+          with connection.cursor() as cursor:
+              cursor.execute(f'CREATE OR REPLACE DATABASE "{target}" CLONE "{source}"')
+          connection.close()
+          print(f"Cloned {source} -> {target}")
+          PY
+
+      - name: dbt build
+        working-directory: dbt
+        run: dbt build --profiles-dir .
+
+      # Runs even when the build fails, so a red pull request never leaves a
+      # database behind in the account.
+      - name: Drop the CI database
+        if: always()
+        run: |
+          python - <<'PY'
+          import os, snowflake.connector
+          target = os.environ["SNOWFLAKE_DATABASE"]
+          connection = snowflake.connector.connect(
+              account=os.environ["SNOWFLAKE_ACCOUNT"],
+              user=os.environ["SNOWFLAKE_USER"],
+              password=os.environ["SNOWFLAKE_PASSWORD"],
+              role=os.environ["SNOWFLAKE_ROLE"],
+              warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
+          )
+          with connection.cursor() as cursor:
+              cursor.execute(f'DROP DATABASE IF EXISTS "{target}"')
+          connection.close()
+          print(f"Dropped {target}")
+          PY

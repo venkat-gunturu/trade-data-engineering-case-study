@@ -1,0 +1,75 @@
+# Deploy the dbt models to the real Snowflake database.
+#
+# Manual only. Merging to main runs CI and changes nothing in Snowflake -
+# deploying is a decision you make, and the `production` environment pauses the
+# job for your approval before it starts.
+#
+# WHAT THIS DEPLOYS, AND WHAT IT DOES NOT
+#   dbt         yes. `dbt build` rebuilds BRONZE -> SILVER -> GOLD from whatever
+#               RAW currently holds, and runs all 58 tests.
+#   Terraform   no. State is local and gitignored, so a runner has no state: a
+#               plan here would describe an empty account and an apply would
+#               fail on objects that already exist. `terraform apply` therefore
+#               stays a local operation, and CI validates the configuration
+#               instead. README section 17 explains the trade-off and the
+#               upgrade path.
+#   Data        no. Loading batches is the Airflow DAG's job, not CI's.
+#
+# ORDER, when standing the project up from scratch:
+#   terraform apply (local)  ->  this workflow  ->  trigger the Airflow DAG
+
+name: Deploy dbt
+
+on:
+  workflow_dispatch:
+
+# Never let two deploys rebuild the same warehouse at the same time.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+
+  deploy-dbt:
+    name: dbt build against TRADE_DB
+    runs-on: ubuntu-latest
+    # The approval gate. Configure required reviewers on this environment in
+    # Settings -> Environments; without them the job simply runs unattended.
+    environment: production
+
+    env:
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+      SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+      SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+      SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+      SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+      DBT_TARGET_SCHEMA: BRONZE
+      DBT_THREADS: "4"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Create the dbt profile
+        run: cp dbt/profiles.yml.example dbt/profiles.yml
+
+      - name: Show what will be deployed
+        run: |
+          echo "Database : $SNOWFLAKE_DATABASE"
+          echo "Warehouse: $SNOWFLAKE_WAREHOUSE"
+          echo "Commit   : ${{ github.sha }}"
+
+      # `dbt build` interleaves each model with its own tests and stops at the
+      # first failure, so a bad model never leaves a half-built GOLD behind.
+      - name: dbt build
+        working-directory: dbt
+        run: dbt build --profiles-dir .
