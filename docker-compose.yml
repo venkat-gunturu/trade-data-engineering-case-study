@@ -1,0 +1,120 @@
+# Local Airflow runtime for the trade pipeline.
+#
+# LocalExecutor with a Postgres metadata database: postgres, a one-shot init
+# container, the scheduler, and the webserver. No Redis / Celery / worker /
+# Flower - they add nothing for three sequential Bash tasks.
+#
+# Snowflake is NOT containerised. It stays the external cloud warehouse, reached
+# with the credentials injected from .env below.
+#
+#   docker compose build
+#   docker compose up -d
+#   http://localhost:8080
+
+x-airflow-env: &airflow-env
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+  AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+  AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+  # Serves the scheduler health endpoint on :8974 that its healthcheck below probes.
+  AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+  # Local-only signing key for the web UI session cookie. Not a Snowflake credential.
+  AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-local-dev-secret-key}
+  # Keep dbt's build artefacts inside the container instead of the mounted dbt/
+  # directory. dbt's partial-parse cache stores absolute paths, so a cache written
+  # by a host run on Windows makes dbt fail inside the Linux container.
+  DBT_TARGET_PATH: /tmp/dbt_target
+  DBT_LOG_PATH: /tmp/dbt_logs
+
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow
+    dockerfile: Dockerfile
+  # Snowflake credentials come from the gitignored .env at the repository root.
+  env_file:
+    - .env
+  environment:
+    <<: *airflow-env
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    # The pipeline components the DAG orchestrates, mounted rather than baked in
+    # so edits on the host take effect without rebuilding the image.
+    - ./data_generator:/opt/airflow/project/data_generator
+    - ./dbt:/opt/airflow/project/dbt
+    - ./data:/opt/airflow/project/data
+    # Failure notification script called by the notify_failure task.
+    - ./monitoring:/opt/airflow/project/monitoring
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # One-shot: migrate the metadata database and create the UI login.
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --role Admin \
+          --username "$${AIRFLOW_WWW_USER:-airflow}" \
+          --password "$${AIRFLOW_WWW_PASSWORD:-airflow}" \
+          --firstname Case --lastname Study \
+          --email admin@example.com || true
+    restart: on-failure
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-db:

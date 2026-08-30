@@ -1,0 +1,17 @@
+# Copy to terraform.tfvars to override any default. Optional - every variable in
+# variables.tf already defaults to the object that exists in Snowflake today.
+#
+# NO CREDENTIALS BELONG IN THIS FILE. The Snowflake provider reads account, user,
+# password, and role from environment variables - see .env.example.
+#
+# *.tfvars is gitignored, so a real terraform.tfvars is never committed.
+
+# database_name          = "TRADE_DB"
+# raw_schema_name        = "RAW"
+# transform_schema_names = ["BRONZE", "SILVER", "GOLD"]
+# warehouse_name         = "TRADE_WH"
+# warehouse_size         = "XSMALL"
+# warehouse_auto_suspend = 60
+# file_format_name       = "JSON_FILE_FORMAT"
+# stage_name             = "TRADE_STAGE"
+# raw_table_name         = "RAW_TRADES"

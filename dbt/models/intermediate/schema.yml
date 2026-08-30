@@ -1,0 +1,62 @@
+version: 2
+
+models:
+  - name: int_trade_sequence
+    description: >
+      Reconstructs arrival order for each trade and derives the state the
+      business rules need. No business rules are applied here.
+    columns:
+      - name: surrogate_key
+        description: Still one row per RAW row at this layer.
+        tests:
+          - unique
+          - not_null
+      - name: trade_id
+        tests:
+          - not_null
+      - name: trade_version
+        tests:
+          - not_null
+      - name: prior_version
+        description: >
+          Highest version seen for this trade before this record arrived.
+          Null for the first record of a trade.
+      - name: previously_established
+        description: >
+          1 when an earlier record for this trade had already reached the trade
+          store. Null for the first record of a trade.
+
+  - name: int_trade_validation
+    description: >
+      Classifies every staged trade as ACCEPTED or REJECTED against the mandatory
+      business rules. One row per staged trade; nothing is filtered out here so
+      the audit trail stays complete.
+    columns:
+      - name: surrogate_key
+        description: Still one row per RAW row at this layer.
+        tests:
+          - unique
+          - not_null
+      - name: trade_id
+        tests:
+          - not_null
+      - name: trade_version
+        tests:
+          - not_null
+      - name: validation_status
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['ACCEPTED', 'REJECTED']
+      - name: rejection_reason
+        description: Null for accepted records; set for every rejected record.
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['LOWER_VERSION', 'PAST_MATURITY']
+              config:
+                where: "validation_status = 'REJECTED'"
+      - name: processed_at
+        tests:
+          - not_null

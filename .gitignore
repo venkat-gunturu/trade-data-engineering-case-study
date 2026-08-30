@@ -1,0 +1,35 @@
+# Credentials
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# dbt
+dbt/target/
+dbt/logs/
+dbt/dbt_packages/
+dbt/.user.yml
+profiles.yml
+
+# Airflow
+airflow/logs/
+airflow/plugins/
+
+# Test artefacts
+.pytest_cache/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfplan
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

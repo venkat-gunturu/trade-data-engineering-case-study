@@ -1,0 +1,20 @@
+# Local development environment (Python 3.12).
+# One venv covers Phase 2 (ingestion) and Phase 3 (dbt).
+#
+# The connector version is NOT a free choice: dbt-snowflake 1.12.0 requires
+# snowflake-connector-python[secure-local-storage] >=4.2.0,<5.0.0, so the two
+# must be resolved together.
+#
+# Airflow (Phase 4) gets its own requirements file inside the Docker image.
+
+snowflake-connector-python==4.7.2
+
+# Synthetic trade generation. Runtime dependency of data_generator/, so Phase 4's
+# airflow/requirements.txt will need this too (but not pytest).
+Faker==40.37.0
+
+dbt-core==1.12.3
+dbt-snowflake==1.12.0
+
+# Dev only.
+pytest==9.1.1

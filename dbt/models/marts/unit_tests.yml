@@ -1,0 +1,83 @@
+version: 2
+
+# Unit tests for the GOLD layer.
+#
+# trade_store is where rule 2 (same version replaces) and rule 4 (expiration)
+# actually take effect, so both are asserted here against fixture rows.
+
+unit_tests:
+
+  - name: rule_2_same_version_resend_replaces_the_earlier_record
+    description: >
+      Rule 2 - same trade_id and same version, later arrival wins. The fixture
+      changes price and notional so "replaced" is distinguishable from "ignored":
+      with identical values the assertion would pass either way.
+    model: trade_store
+    given:
+      - input: ref('int_trade_validation')
+        rows:
+          - {trade_id: "T1", trade_version: 2, event_timestamp: "2026-01-02 09:00:00", surrogate_key: 2, maturity_date: "2027-01-01", price: 100.00, notional_amount: 1000.00, validation_status: "ACCEPTED"}
+          - {trade_id: "T1", trade_version: 2, event_timestamp: "2026-01-03 09:00:00", surrogate_key: 3, maturity_date: "2027-01-01", price: 250.50, notional_amount: 9999.00, validation_status: "ACCEPTED"}
+    expect:
+      rows:
+        - {trade_id: "T1", trade_version: 2, price: 250.50, notional_amount: 9999.00, status: "VALID"}
+
+  - name: highest_version_wins_regardless_of_arrival_order
+    description: >
+      Ranking is (trade_version desc, event_timestamp desc, surrogate_key desc), so
+      version dominates even when the lower version arrived later.
+    model: trade_store
+    given:
+      - input: ref('int_trade_validation')
+        rows:
+          - {trade_id: "T1", trade_version: 3, event_timestamp: "2026-01-01 09:00:00", surrogate_key: 1, maturity_date: "2027-01-01", price: 10.00, notional_amount: 100.00, validation_status: "ACCEPTED"}
+          - {trade_id: "T1", trade_version: 2, event_timestamp: "2026-01-09 09:00:00", surrogate_key: 2, maturity_date: "2027-01-01", price: 20.00, notional_amount: 200.00, validation_status: "ACCEPTED"}
+    expect:
+      rows:
+        - {trade_id: "T1", trade_version: 3, price: 10.00, status: "VALID"}
+
+  - name: rejected_records_never_reach_the_trade_store
+    description: >
+      Rule 1 outcome seen from GOLD - the stale version is filtered out and the
+      trade remains current at its higher version, exactly one row.
+    model: trade_store
+    given:
+      - input: ref('int_trade_validation')
+        rows:
+          - {trade_id: "T1", trade_version: 2, event_timestamp: "2026-01-02 09:00:00", surrogate_key: 2, maturity_date: "2027-01-01", price: 50.00, notional_amount: 500.00, validation_status: "ACCEPTED"}
+          - {trade_id: "T1", trade_version: 1, event_timestamp: "2026-01-03 09:00:00", surrogate_key: 3, maturity_date: "2027-01-01", price: 77.00, notional_amount: 700.00, validation_status: "REJECTED"}
+    expect:
+      rows:
+        - {trade_id: "T1", trade_version: 2, price: 50.00, status: "VALID"}
+
+  - name: rule_4_matured_trade_is_marked_expired
+    description: >
+      Rule 4 - a trade that reached the store and whose maturity date has since
+      passed shows EXPIRED. This state cannot be produced by loading data, because
+      a freshly loaded past-maturity trade is rejected by rule 3 first; a fixture
+      is the only way to assert it.
+    model: trade_store
+    given:
+      - input: ref('int_trade_validation')
+        rows:
+          - {trade_id: "T_EXPIRED", trade_version: 1, event_timestamp: "2020-01-01 09:00:00", surrogate_key: 1, maturity_date: "2020-06-30", price: 10.00, notional_amount: 100.00, validation_status: "ACCEPTED"}
+          - {trade_id: "T_VALID",   trade_version: 1, event_timestamp: "2020-01-01 09:00:00", surrogate_key: 2, maturity_date: "2099-12-31", price: 10.00, notional_amount: 100.00, validation_status: "ACCEPTED"}
+    expect:
+      rows:
+        - {trade_id: "T_EXPIRED", status: "EXPIRED"}
+        - {trade_id: "T_VALID",   status: "VALID"}
+
+  - name: exactly_one_row_per_trade_id
+    description: >
+      The logical key of the store. Three accepted records for one trade collapse
+      to a single current row.
+    model: trade_store
+    given:
+      - input: ref('int_trade_validation')
+        rows:
+          - {trade_id: "T1", trade_version: 1, event_timestamp: "2026-01-01 09:00:00", surrogate_key: 1, maturity_date: "2027-01-01", price: 1.00, notional_amount: 10.00, validation_status: "ACCEPTED"}
+          - {trade_id: "T1", trade_version: 2, event_timestamp: "2026-01-02 09:00:00", surrogate_key: 2, maturity_date: "2027-01-01", price: 2.00, notional_amount: 20.00, validation_status: "ACCEPTED"}
+          - {trade_id: "T1", trade_version: 3, event_timestamp: "2026-01-03 09:00:00", surrogate_key: 3, maturity_date: "2027-01-01", price: 3.00, notional_amount: 30.00, validation_status: "ACCEPTED"}
+    expect:
+      rows:
+        - {trade_id: "T1", trade_version: 3, price: 3.00, status: "VALID"}

@@ -1,0 +1,31 @@
+[
+  {
+    "trade_id": "T999001",
+    "trade_version": 1,
+    "trade_type": "BUY",
+    "instrument_type": "FX",
+    "counterparty": "Malformed Fixture Ltd",
+    "trade_date": "2026-08-28",
+    "event_timestamp": "2026-08-28T09:00:00",
+    "maturity_date": "2027-09-30",
+    "notional_amount": 1000000.00,
+    "currency": "USD",
+    "price": 1.0845,
+    "quantity": 1000000,
+    "trade_status": "NEW"
+  },
+  {
+    "trade_id": "T999002",
+    "trade_version": "not-a-number",
+    "trade_type": "BUY",
+    "instrument_type": "FX",
+    "counterparty": "Malformed Fixture Ltd",
+    "trade_date": "NOT-A-DATE",
+    "event_timestamp": "2026-08-28T09:00:00",
+    "maturity_date": "2027-09-30",
+    "notional_amount": "abc",
+    "currency": "TOO_LONG_CURRENCY_CODE",
+    "price": 1.0845,
+    "quantity": 1000000,
+    "trade_status": "NEW"
+  }

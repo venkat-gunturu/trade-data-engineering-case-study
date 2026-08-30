@@ -1,0 +1,32 @@
+version: 2
+
+sources:
+  - name: raw
+    database: "{{ env_var('SNOWFLAKE_DATABASE', 'TRADE_DB') }}"
+    schema: RAW
+    description: >
+      Append-only landing zone written by data_generator/ingest_trades.py using
+      PUT + COPY INTO. dbt only ever reads from here. RAW remains the source of
+      truth for the original, unflattened payload.
+    tables:
+      - name: raw_trades
+        description: One row per trade message, payload held as VARIANT.
+        columns:
+          - name: surrogate_key
+            description: AUTOINCREMENT arrival key; also the tie-break of last resort.
+            tests:
+              - unique
+              - not_null
+          - name: payload
+            description: The original trade JSON object, stored unflattened.
+            tests:
+              - not_null
+          - name: batch_id
+            tests:
+              - not_null
+          - name: source_file_name
+            tests:
+              - not_null
+          - name: ingested_at
+            tests:
+              - not_null

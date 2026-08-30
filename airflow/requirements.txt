@@ -1,0 +1,11 @@
+# Dependencies for the isolated pipeline virtual environment (/opt/pipeline_venv)
+# inside the Airflow image. Deliberately NOT installed into Airflow's own Python
+# environment - see airflow/Dockerfile for why.
+#
+# Same set as the root requirements.txt, minus pytest, which is development only.
+
+snowflake-connector-python==4.7.2
+Faker==40.37.0
+
+dbt-core==1.12.3
+dbt-snowflake==1.12.0

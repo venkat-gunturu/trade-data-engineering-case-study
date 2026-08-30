@@ -1,0 +1,20 @@
+# Copy to dbt/profiles.yml (gitignored) and run dbt with --profiles-dir .
+# Every value comes from the environment: no credentials are ever committed.
+#
+# dbt does NOT read the project's .env file. Export the variables into your
+# shell first - see the Phase 3 run instructions.
+
+trade_pipeline:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE') }}"
+      database: "{{ env_var('SNOWFLAKE_DATABASE') }}"
+      schema: "{{ env_var('DBT_TARGET_SCHEMA', 'BRONZE') }}"
+      threads: "{{ env_var('DBT_THREADS', '4') | int }}"
+      client_session_keep_alive: false

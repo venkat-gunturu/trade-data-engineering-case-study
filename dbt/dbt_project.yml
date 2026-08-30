@@ -1,0 +1,26 @@
+name: 'trade_pipeline'
+version: '1.0.0'
+config-version: 2
+
+profile: 'trade_pipeline'
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+
+clean-targets: ["target", "dbt_packages"]
+
+# Folder -> schema mapping. The generate_schema_name override in macros/ makes
+# these land in the schema named literally, instead of dbt's default
+# <target_schema>_<custom_schema> concatenation.
+models:
+  trade_pipeline:
+    staging:
+      +schema: BRONZE
+      +materialized: table
+    intermediate:
+      +schema: SILVER
+      +materialized: table
+    marts:
+      +schema: GOLD
+      +materialized: table

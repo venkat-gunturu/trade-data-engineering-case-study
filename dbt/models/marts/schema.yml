@@ -1,0 +1,61 @@
+version: 2
+
+models:
+  - name: trade_store
+    description: >
+      Current state of each trade. Logical key is trade_id, with exactly one
+      current record per trade.
+    columns:
+      - name: trade_id
+        description: Logical current-state key.
+        tests:
+          - unique
+          - not_null
+      - name: trade_version
+        tests:
+          - not_null
+      - name: maturity_date
+        tests:
+          - not_null
+      - name: event_timestamp
+        tests:
+          - not_null
+      - name: status
+        description: VALID, or EXPIRED once maturity_date has passed.
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['VALID', 'EXPIRED']
+      - name: updated_timestamp
+        tests:
+          - not_null
+
+  - name: rejected_trades
+    description: >
+      Audit trail of every rejected trade, retained for compliance (rule 5).
+    columns:
+      - name: trade_id
+        tests:
+          - not_null
+      - name: trade_version
+        tests:
+          - not_null
+      - name: rejection_reason
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['LOWER_VERSION', 'PAST_MATURITY']
+      - name: rejected_at
+        tests:
+          - not_null
+      - name: source_file_name
+        tests:
+          - not_null
+      - name: ingested_at
+        tests:
+          - not_null
+      - name: batch_id
+        tests:
+          - not_null

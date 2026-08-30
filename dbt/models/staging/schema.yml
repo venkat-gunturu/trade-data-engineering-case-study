@@ -1,0 +1,36 @@
+version: 2
+
+models:
+  - name: stg_trades
+    description: >
+      Relational projection of RAW.RAW_TRADES.payload. Extraction and casting
+      only; one row per RAW row.
+    columns:
+      - name: surrogate_key
+        description: Inherited from RAW; one row per RAW row.
+        tests:
+          - unique
+          - not_null
+      - name: trade_id
+        tests:
+          - not_null
+      - name: trade_version
+        tests:
+          - not_null
+      - name: maturity_date
+        description: Required by rules 3 and 4.
+        tests:
+          - not_null
+      - name: event_timestamp
+        description: Primary ordering key for reconstructing arrival order.
+        tests:
+          - not_null
+      - name: batch_id
+        tests:
+          - not_null
+      - name: source_file_name
+        tests:
+          - not_null
+      - name: ingested_at
+        tests:
+          - not_null

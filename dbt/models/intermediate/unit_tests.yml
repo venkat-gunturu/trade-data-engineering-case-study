@@ -1,0 +1,132 @@
+version: 2
+
+# Unit tests for the SILVER layer.
+#
+# These assert rule LOGIC against fixture rows rather than against whatever
+# happens to be loaded in Snowflake. That matters for two reasons:
+#
+#   1. Rule 4 (expiry) is unreachable by loading data. A freshly loaded trade has
+#      ingested_at = today, so it is either rejected by rule 3 (maturity < today)
+#      or it cannot be expired (maturity >= today). Only a fixture can build the
+#      state where a trade was established earlier and has since matured.
+#   2. Loaded-data assertions would make `dbt build` fail on a fresh clone that
+#      has only BATCH_001, since no rejections exist there.
+
+unit_tests:
+
+  # ---------------------------------------------------------------- sequencing
+
+  - name: first_record_for_a_trade_has_no_prior_state
+    description: >
+      A trade the store has never seen must produce null prior_version and null
+      previously_established - the window looks only at earlier rows.
+    model: int_trade_sequence
+    given:
+      - input: ref('stg_trades')
+        rows:
+          - {trade_id: "T1", trade_version: 1, event_timestamp: "2026-01-01 09:00:00", surrogate_key: 1, maturity_date: "2027-01-01", ingested_at: "2026-01-01 10:00:00"}
+    expect:
+      rows:
+        - {trade_id: "T1", prior_version: null, previously_established: null}
+
+  - name: prior_version_reflects_the_highest_earlier_version
+    description: >
+      Arrival order is (event_timestamp, surrogate_key). The third record must see
+      version 2 as its prior version, not version 1.
+    model: int_trade_sequence
+    given:
+      - input: ref('stg_trades')
+        rows:
+          - {trade_id: "T1", trade_version: 1, event_timestamp: "2026-01-01 09:00:00", surrogate_key: 1, maturity_date: "2027-01-01", ingested_at: "2026-01-01 10:00:00"}
+          - {trade_id: "T1", trade_version: 2, event_timestamp: "2026-01-02 09:00:00", surrogate_key: 2, maturity_date: "2027-01-01", ingested_at: "2026-01-02 10:00:00"}
+          - {trade_id: "T1", trade_version: 1, event_timestamp: "2026-01-03 09:00:00", surrogate_key: 3, maturity_date: "2027-01-01", ingested_at: "2026-01-03 10:00:00"}
+    expect:
+      rows:
+        - {trade_id: "T1", surrogate_key: 1, prior_version: null, previously_established: null}
+        - {trade_id: "T1", surrogate_key: 2, prior_version: 1, previously_established: 1}
+        - {trade_id: "T1", surrogate_key: 3, prior_version: 2, previously_established: 1}
+
+  - name: previously_established_is_zero_when_the_first_record_was_already_matured
+    description: >
+      A trade whose first record arrived past maturity never reached the store, so
+      a later record must not be treated as established.
+    model: int_trade_sequence
+    given:
+      - input: ref('stg_trades')
+        rows:
+          - {trade_id: "T1", trade_version: 1, event_timestamp: "2026-01-01 09:00:00", surrogate_key: 1, maturity_date: "2025-01-01", ingested_at: "2026-01-01 10:00:00"}
+          - {trade_id: "T1", trade_version: 2, event_timestamp: "2026-01-02 09:00:00", surrogate_key: 2, maturity_date: "2025-01-01", ingested_at: "2026-01-02 10:00:00"}
+    expect:
+      rows:
+        - {trade_id: "T1", surrogate_key: 1, prior_version: null, previously_established: null}
+        - {trade_id: "T1", surrogate_key: 2, prior_version: 1, previously_established: 0}
+
+  # ------------------------------------------------------------ rule decisions
+
+  - name: rule_1_lower_version_is_rejected
+    description: Rule 1 - a stale message below the highest version already seen.
+    model: int_trade_validation
+    given:
+      - input: ref('int_trade_sequence')
+        rows:
+          - {trade_id: "T1", trade_version: 1, maturity_date: "2027-01-01", ingested_at: "2026-01-03 10:00:00", prior_version: 2, previously_established: 1, surrogate_key: 3}
+    expect:
+      rows:
+        - {trade_id: "T1", validation_status: "REJECTED", rejection_reason: "LOWER_VERSION"}
+
+  - name: rule_3_past_maturity_on_arrival_is_rejected
+    description: >
+      Rule 3 - already matured when it arrived, and no earlier record established
+      the trade.
+    model: int_trade_validation
+    given:
+      - input: ref('int_trade_sequence')
+        rows:
+          - {trade_id: "T1", trade_version: 1, maturity_date: "2025-01-01", ingested_at: "2026-01-01 10:00:00", prior_version: null, previously_established: null, surrogate_key: 1}
+    expect:
+      rows:
+        - {trade_id: "T1", validation_status: "REJECTED", rejection_reason: "PAST_MATURITY"}
+
+  - name: an_established_trade_is_not_rejected_for_past_maturity
+    description: >
+      The rule 3 / rule 4 boundary. A trade already in the store is NOT rejected
+      when a later version arrives past maturity - it stays eligible for the store,
+      where rule 4 marks it EXPIRED. Without this exemption rule 4 is unreachable.
+    model: int_trade_validation
+    given:
+      - input: ref('int_trade_sequence')
+        rows:
+          - {trade_id: "T1", trade_version: 2, maturity_date: "2025-01-01", ingested_at: "2026-01-02 10:00:00", prior_version: 1, previously_established: 1, surrogate_key: 2}
+    expect:
+      rows:
+        - {trade_id: "T1", validation_status: "ACCEPTED", rejection_reason: null}
+
+  - name: past_maturity_takes_precedence_over_lower_version
+    description: >
+      Agreed precedence - an intrinsic property of the record is checked before a
+      comparison against stored state.
+    model: int_trade_validation
+    given:
+      - input: ref('int_trade_sequence')
+        rows:
+          - {trade_id: "T1", trade_version: 1, maturity_date: "2025-01-01", ingested_at: "2026-01-03 10:00:00", prior_version: 2, previously_established: 0, surrogate_key: 3}
+    expect:
+      rows:
+        - {trade_id: "T1", validation_status: "REJECTED", rejection_reason: "PAST_MATURITY"}
+
+  - name: new_and_higher_and_same_version_are_all_accepted
+    description: >
+      Only lower version and past maturity reject. A new trade, an amendment, and
+      a same-version re-send are all accepted.
+    model: int_trade_validation
+    given:
+      - input: ref('int_trade_sequence')
+        rows:
+          - {trade_id: "T_NEW",    trade_version: 1, maturity_date: "2027-01-01", ingested_at: "2026-01-01 10:00:00", prior_version: null, previously_established: null, surrogate_key: 1}
+          - {trade_id: "T_HIGHER", trade_version: 2, maturity_date: "2027-01-01", ingested_at: "2026-01-02 10:00:00", prior_version: 1,    previously_established: 1,    surrogate_key: 2}
+          - {trade_id: "T_SAME",   trade_version: 2, maturity_date: "2027-01-01", ingested_at: "2026-01-03 10:00:00", prior_version: 2,    previously_established: 1,    surrogate_key: 3}
+    expect:
+      rows:
+        - {trade_id: "T_NEW",    validation_status: "ACCEPTED", rejection_reason: null}
+        - {trade_id: "T_HIGHER", validation_status: "ACCEPTED", rejection_reason: null}
+        - {trade_id: "T_SAME",   validation_status: "ACCEPTED", rejection_reason: null}
