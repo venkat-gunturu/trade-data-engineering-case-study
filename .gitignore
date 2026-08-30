@@ -18,6 +18,9 @@ profiles.yml
 airflow/logs/
 airflow/plugins/
 
+# Generator checkpoint
+data/.generation_progress
+
 # Test artefacts
 .pytest_cache/
 

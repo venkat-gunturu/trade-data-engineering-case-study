@@ -563,27 +563,202 @@ scenarios cannot be generated randomly.
 Reproducibility: `--seed` fixes the RNG and `--as-of-date` anchors every date, so
 a given seed and anchor always produce byte-identical files.
 
+### One batch per invocation
+
+`generate_trades.py` writes **one** file per run, not all four. A local
+checkpoint, `data/.generation_progress`, lists the file names already written in
+the current cycle, one per line:
+
+```text
+invocation 1   clear data/archive/, write trades_batch_001.json
+invocation 2                        write trades_batch_002.json
+invocation 3                        write trades_batch_003.json
+invocation 4                        write trades_batch_004.json
+invocation 5   reset checkpoint, clear data/archive/, write trades_batch_001.json
+```
+
+So a **scheduled** generation DAG drip-feeds one file at a time into `data/`,
+which is what the pipeline is built to react to, instead of dumping the whole
+data set at once.
+
+Two things the generator never touches: files sitting directly in `data/` — they
+are waiting for the pipeline and would be lost — and `data/archive/` in the
+middle of a cycle. Archive is cleared only at a cycle boundary, where everything
+in it has already been processed.
+
+Because the scenarios depend on each other across batches, each invocation still
+builds the whole four-batch sequence in memory from the same seed and anchor date
+and writes only the batch it owns. The content is therefore identical to what an
+all-at-once run produced.
+
+A checkpoint file is enough here — the generator and Airflow share the same
+mounted `data/` directory, so there is nothing to coordinate across hosts and no
+reason for a table. It is safe if missing, empty, partially filled, or complete.
+The file is git-ignored: it is local run state, not source.
+
 
 ## 14. Airflow Architecture
 
 Airflow orchestrates the components built in Phases 2 and 3. It does not
 reimplement any of them.
 
+**Two independent DAGs**, connected only by a directory. Generation produces
+files; the pipeline reacts to whatever files are there when it runs. There is no
+Airflow dependency between them, so either can be triggered, rescheduled or
+re-run on its own.
+
 ```text
-generate_trades        data_generator/generate_trades.py
-        |
-        v
-ingest_trades          data_generator/ingest_trades.py  (PUT + COPY INTO)
-        |
-        v
-dbt_build              dbt build  (models + tests)
+trade_data_generation                         trade_pipeline
+─────────────────────                         ──────────────
+generate_trades                               find_files      what is waiting in data/?
+      |                                             |
+      v                                             v
+   data/trades_batch_NNN.json  ------------>  ingest_trades   PUT + COPY INTO
+                                                    |
+                                                    v
+                                              dbt_build       models + tests
+                                                    |
+                                                    v
+                                              archive_files   data/ -> data/archive/
 ```
 
-`dbt build` interleaves each model with its own tests and fails on the first
-failure, so there is no separate test task.
+### Directories
 
-The DAG lives in `airflow/dags/trade_pipeline.py` and uses `BashOperator`,
-because both Python components are CLIs with argparse and non-zero exit codes.
+```text
+data/                        waiting to be processed
+  trades_batch_001.json
+  trades_batch_002.json
+  .generation_progress       generator checkpoint, git-ignored
+  archive/                   successfully processed
+    trades_batch_003.json
+```
+
+The generator writes only to `data/`. The pipeline reads only from `data/`, and
+moves a file to `data/archive/` once it is done with it. Discovery is **not
+recursive**, which is what keeps `data/archive/` from being picked up again, and
+it matches `trades_batch_*.json`, so the `.generation_progress` checkpoint is
+never mistaken for input.
+
+The files are plain `.json`. Compression happens in flight — `PUT ... AUTO_COMPRESS`
+gzips on upload, so the stage holds `.json.gz` while the local file stays `.json`.
+
+### File-driven, not batch-driven
+
+The pipeline has no `batch` parameter and no hardcoded `BATCH_001`. Every run
+processes whatever is present, whether that is one file or several.
+
+| On a run | What happens |
+| --- | --- |
+| Files waiting | All of them are ingested, dbt rebuilds, then all of them are archived |
+| `data/` empty | `find_files` short-circuits. Ingestion and dbt are **skipped**, the run is **successful**, and the log says `No files available for processing.` No warehouse cost |
+| Ingestion fails | DAG fails. Files stay in `data/`. Nothing is archived |
+| dbt fails | DAG fails. Files stay in `data/`. Nothing is archived |
+
+Archiving is the last task, downstream of both ingestion and dbt, so a file is
+only ever archived after its rows are in Snowflake *and* the models rebuilt.
+Failed files are never deleted — the next run retries them.
+
+`find_files` is a `ShortCircuitOperator`: it returns the list of files it found,
+which serves as both the run/skip decision and the exact list handed to
+`ingest_trades` and `archive_files` through XCom. A file generated midway through
+a run is therefore left for the next run rather than ingested but not archived.
+
+### Scheduling
+
+```text
+trade_data_generation   schedule=None      manual; set a cron to schedule it
+trade_pipeline          */30 * * * *       every 30 minutes
+```
+
+DAGs are paused at creation, so nothing runs until you unpause it in the UI. A
+scheduled DAG can still be triggered by hand at any time.
+
+```text
+10:00  generation runs      -> data/trades_batch_001.json
+10:30  pipeline runs        -> ingests, dbt, moves it to data/archive/
+11:00  pipeline runs        -> data/ empty, "No files available", SUCCESS
+11:30  generation runs      -> data/trades_batch_002.json  (next in the cycle)
+12:00  pipeline runs        -> ingests, dbt, archives
+```
+
+Each generation run advances the cycle by one batch, so BATCH_001 through
+BATCH_004 arrive over four runs and the fifth starts the cycle again.
+
+### Idempotency, stated honestly
+
+The operational guard is the directory move: **once a file is archived it is no
+longer in `data/`, so a normal run cannot process it twice.** That is the
+mechanism the design relies on.
+
+Snowflake's load history is a second line of defence, not the primary one. `PUT`
+uses `OVERWRITE = TRUE` because batch file names repeat every generation cycle —
+without it the second cycle's upload would be `SKIPPED` and the load would take
+the previous cycle's bytes. The staged file is then **deliberately retained**
+after `COPY INTO`: it costs almost nothing and leaves the exact bytes Snowflake
+loaded available for inspection. If `COPY INTO` fails the file stays staged and
+the retry re-uploads it.
+
+Deleting files from `data/` or `data/archive/` and regenerating is safe and
+supported; nothing blocks a re-run. Re-ingesting content Snowflake has already
+loaded needs the `force_reload` parameter, which **does** add duplicate rows to
+RAW — Rule 2 then collapses them, so `TRADE_STORE` stays correct.
+
+### Notification email — MANUAL PREREQUISITE
+
+The DAG reports its own outcome by email, with no notification task in the graph:
+
+| Outcome | How | Fires |
+| --- | --- | --- |
+| Failure | `email_on_failure` in `default_args` — Airflow's **built-in**, no code | Once, when a task reaches `failed` |
+| Success | `send_dag_success_email`, one function in `trade_pipeline.py` | Once per successful run |
+
+Mail is sent by Airflow's own SMTP mailer, configured with the
+`AIRFLOW__SMTP__*` variables in `docker-compose.yml`, which read from `.env`:
+
+```text
+SMTP_HOST / SMTP_PORT / SMTP_STARTTLS    the server (Gmail: smtp.gmail.com, 587, True)
+SMTP_USER / SMTP_PASSWORD                the credential
+SMTP_MAIL_FROM                           the sender address
+ALERT_EMAIL_RECIPIENT                    who receives the mail
+```
+
+**Gmail needs an App Password**, not your account password: enable 2-Step
+Verification, then generate a 16-character App Password at *myaccount.google.com
+→ Security → App passwords*. Your normal password fails with SMTP error `535`.
+`.env` is gitignored; only `.env.example` is committed, and CI never sends mail
+(section 17).
+
+`ALERT_EMAIL_RECIPIENT` is shared with the Snowflake sender described in section
+15, which requires a **verified** email address of a user in your Snowflake
+account (Snowsight → profile → verify email). Use an address that satisfies both.
+
+Two behaviours worth knowing:
+
+- **The failure email fires once, not three times.** `retries = 2` means a task
+  with retries left goes to `up_for_retry`, not `failed`, and only `failed`
+  sends the mail. You get one email per failed task, after its final attempt.
+- **A short-circuited run sends nothing.** When `data/` is empty `find_files`
+  short-circuits, everything downstream is skipped, and the run is correctly
+  *successful*. The DAG runs every 30 minutes, so mailing on that would send 48
+  "success" notifications a day reporting that nothing happened. The success
+  function checks whether `ingest_trades` was skipped and returns early.
+
+If `ALERT_EMAIL_RECIPIENT` is unset the recipient list is empty and no mail is
+attempted — the pipeline still runs and a failure is still red in the UI.
+
+This is a simple operational alert: it says which task failed, nothing more. It
+is separate from the Snowflake monitoring *alert* in section 15, which watches
+the data rather than the orchestrator.
+
+`monitoring/send_failure_alert.py` remains as a **standalone CLI** — a second,
+independent route that asks Snowflake to send the mail via `SYSTEM$SEND_EMAIL`
+on the `TRADE_ALERT_EMAIL` integration. The DAG does not call it. It is there for
+when SMTP is unavailable, and to prove the Snowflake integration works without
+waiting for a real failure.
+
+Both DAGs use `BashOperator`, because the Python components are CLIs with
+argparse and non-zero exit codes. `dbt build` interleaves each model with its own
+tests and fails on the first failure, so there is no separate test task.
 
 ### Docker runtime
 
@@ -625,46 +800,49 @@ docker compose ps          # postgres, scheduler, webserver healthy
 Open http://localhost:8080 and log in with the values of `AIRFLOW_WWW_USER` /
 `AIRFLOW_WWW_PASSWORD` from `.env` (defaults `airflow` / `airflow`, local only).
 
-### Trigger the DAG
+### Trigger the DAGs
 
-Unpause `trade_pipeline`, then **Trigger DAG w/ config**. Parameters:
+The normal manual test cycle:
 
-| Param | Default | Meaning |
-| --- | --- | --- |
-| `batch` | `001` | Which generated batch to ingest |
-| `seed` | `42` | Generator seed, keeps the batch reproducible |
-| `force_reload` | `false` | Pass `--force` to the loader; **duplicates RAW rows** |
+1. Unpause and trigger **`trade_data_generation`**. Expected: **one** batch file
+   appears in `data/` — `trades_batch_001.json` on the first run of a cycle. Trigger
+   it again for the next batch; four runs cover the full data set.
+2. Unpause and trigger **`trade_pipeline`**. Expected: four green tasks —
+   `find_files`, `ingest_trades`, `dbt_build`, `archive_files` — and the files
+   have moved to `data/archive/`.
+3. Trigger `trade_pipeline` again with `data/` now empty. Expected: `find_files`
+   green, the other three **skipped**, run **successful**, log reads
+   `No files available for processing.`
 
-Expected: three green tasks in order, `dbt_build` reporting 5 models and 45
-tests passing.
+To start over, delete files from `data/` and `data/archive/`, delete
+`data/.generation_progress`, and trigger generation again. Nothing blocks a
+re-run. (Deleting the checkpoint is what forces the cycle back to BATCH_001; the
+generator does that by itself once the fourth batch is done.)
+
+| DAG | Param | Default | Meaning |
+| --- | --- | --- | --- |
+| `trade_data_generation` | `seed` | `42` | Generator seed, keeps the batch reproducible |
+| | `records_per_batch` | `200` | Trades per batch file |
+| `trade_pipeline` | `force_reload` | `false` | Pass `--force` to the loader; **duplicates RAW rows** |
 
 ### Re-run behaviour
 
-Generation is pinned to the run's logical date (`{{ ds }}`) and a fixed seed,
-and the loader uses `COPY INTO ... FORCE = FALSE`.
-
 | Situation | Result |
 | --- | --- |
-| Retry a failed `ingest_trades` | Safe. A failed `COPY INTO` commits nothing, so the retry starts clean. |
-| Re-run the same DAG run | RAW gains a second copy of the batch. `TRADE_STORE` and `REJECTED_TRADES` do not change — see below. |
-| Run on a different day | `{{ ds }}` changes, so the generated content changes and the batch loads as new data. Same `trade_id`s at the same versions, which Rule 2 treats as same-version re-sends. |
-| `force_reload = true` | Deliberately reloads. Same effect as a re-run, made explicit. |
+| Re-run the pipeline with `data/` empty | Clean success. Nothing ingested, no dbt run |
+| Retry a failed `ingest_trades` | Safe. A failed `COPY INTO` commits nothing, and the staged file is re-used |
+| Retry after a dbt failure | Files are still in `data/`, so the next run picks them up again |
+| Re-run generation | Writes the **next** batch file in the cycle into `data/`. The next pipeline run processes it |
+| Re-run generation after the fourth batch | Cycle rolls over: `data/archive/` is cleared, the checkpoint reset, `trades_batch_001.json` written again |
+| `force_reload = true` | Deliberately reloads content already loaded, which **does** add duplicate rows to RAW |
 
-**The pipeline is business-state idempotent, but RAW is append-only and grows on a
-re-run.** With the current design that happens because `PUT ... OVERWRITE = TRUE`
-replaces the staged file, so its metadata changes and `COPY INTO ... FORCE = FALSE`
-treats it as a file it has not seen. Load history only protects a staged file that is
-*not* re-uploaded.
-
-Measured: re-running the full pipeline through Airflow took RAW from 800 to 1,000 rows,
-while `TRADE_STORE` stayed at 700 and `REJECTED_TRADES` at 35 — the duplicate records
-arrive as same-version re-sends and Rule 2 collapses them. RAW behaving this way is
-consistent with what RAW is for: an append-only audit record of every message received,
-including one received twice.
-
-Making the staged path run-scoped in `ingest_trades.py` would make RAW append-idempotent
-as well. That is a deliberate future enhancement rather than a Phase 7 change, and it is
-listed in section 20.
+**The pipeline is business-state idempotent.** Duplicate records arrive as
+same-version re-sends and Rule 2 collapses them, so `TRADE_STORE` and
+`REJECTED_TRADES` stay correct while RAW grows. Measured during Phase 7: a
+deliberate reload took RAW from 800 to 1,000 rows while `TRADE_STORE` stayed at
+700 and `REJECTED_TRADES` at 35. RAW behaving this way is consistent with what
+RAW is for — an append-only audit record of every message received, including one
+received twice.
 
 One further consequence worth knowing: **generating on the Windows host and in the Linux
 container produces different bytes for identical data.** `generate_trades.py` opens files
@@ -713,18 +891,18 @@ Nothing new was needed here — the DAG already fails honestly:
   so downstream models are skipped rather than built from bad input.
 - The Airflow UI shows task state, retry count, duration and full logs per run.
 
-Phase 7 adds one task, `notify_failure`, with `trigger_rule = "one_failed"`. It runs only
-when a pipeline task has failed, and asks Snowflake to email the failure through the
-`TRADE_ALERT_EMAIL` notification integration — so **no SMTP server or external
-notification service is part of this project**.
+On failure, `email_on_failure` in `default_args` emails `ALERT_EMAIL_RECIPIENT` over SMTP
+(section 14), naming the task and linking to its log. This is Airflow's built-in mechanism,
+so it needs no code, and being in `default_args` means every task is covered — a task added
+later cannot be forgotten. Notification is configuration rather than a node, so the graph
+stays the four tasks that actually do work, and nothing has to exit non-zero to keep the run
+red.
 
-It then exits non-zero on purpose. Airflow decides a DAG run's state from its leaf tasks,
-and `notify_failure` is the leaf; if it succeeded, a run whose dbt build had failed would
-be reported as successful. Failing it keeps the run red, which is the truth. On a
-successful run the task is skipped, and a skipped leaf leaves the run green.
+On success, the DAG-level `on_success_callback` sends one summary per run — unless the run
+short-circuited on an empty `data/`, in which case it stays quiet.
 
-If `ALERT_EMAIL_RECIPIENT` is not configured the task says so loudly in its log and still
-fails. A missing notification never turns a failed run into a successful-looking one.
+That email answers "a task failed". The Snowflake alert below answers "the data is wrong".
+They are separate on purpose.
 
 ### `MONITORING.V_PIPELINE_HEALTH`
 
@@ -781,9 +959,11 @@ WHERE status = 'DEGRADED' AND day >= DATEADD(day, -1, CURRENT_DATE());
 
 When that returns a row, the alert calls `SYSTEM$SEND_EMAIL`.
 
-It complements rather than duplicates `notify_failure`: Airflow reports that a **task**
-failed, the alert reports that the **outcome in Snowflake** is bad — including work Airflow
-never orchestrated, such as a manual `dbt build` or a direct load.
+It complements rather than duplicates the DAG's failure email: Airflow reports that a
+**task** failed, the alert reports that the **outcome in Snowflake** is bad — including
+work Airflow never orchestrated, such as a manual `dbt build` or a direct load. They also
+deliver by different routes: the alert through the `TRADE_ALERT_EMAIL` integration, Airflow
+over SMTP, so neither depends on the other working.
 
 It is deliberately left **suspended**. A resumed alert consumes credits at every evaluation,
 which is not appropriate for a development account. Run it on demand instead:
@@ -841,7 +1021,7 @@ timestamps, which is requirement 5 (log rejected trades for audit).
 
 Three independent ways, in increasing distance from the run:
 
-1. `dbt build` exits non-zero, so the Airflow task fails and `notify_failure` fires.
+1. `dbt build` exits non-zero, so the Airflow task fails and emails the failure.
 2. `V_PIPELINE_HEALTH.DBT_FAILURES` becomes non-zero for the day.
 3. `ALERT_PIPELINE_FAILURE` matches and emails.
 
@@ -938,8 +1118,10 @@ a user in the account.
 1. In Snowsight, open your profile and verify your email address.
 2. Put that address in `monitoring/sql/monitoring.sql` (it appears once, as
    `you@example.com`) before running the file.
-3. Add `ALERT_EMAIL_RECIPIENT=<that address>` to `.env`, so the Airflow `notify_failure`
-   task can use it. `.env` is gitignored; only `.env.example` is committed.
+
+The same integration carries the standalone `send_failure_alert.py` CLI's email, so
+verifying the address once covers both. The DAG's own emails go over SMTP and need no
+verification — see section 14.
 
 Test the channel on its own:
 
@@ -1072,9 +1254,9 @@ Roles and grants are deliberately not managed. The project runs as
 Terraform creates empty infrastructure. To populate it:
 
 ```bash
-# directly
+# directly - one generator run writes one batch file
 cd data_generator
-python generate_trades.py --seed 42
+python generate_trades.py --seed 42          # -> data/trades_batch_001.json
 python ingest_trades.py --batch 001
 cd ../dbt && dbt build --profiles-dir .
 
@@ -1230,8 +1412,10 @@ Plain workflow configuration, not secrets: `DBT_TARGET_SCHEMA=BRONZE`, `DBT_THRE
 the CI clone name. These are naming, not credentials.
 
 Not needed by CI at all: `SNOWFLAKE_ORGANIZATION_NAME` and `SNOWFLAKE_ACCOUNT_NAME`
-(Terraform provider only, and Terraform never authenticates in CI), `ALERT_EMAIL_RECIPIENT`
-and the `AIRFLOW_*` values (local runtime only).
+(Terraform provider only, and Terraform never authenticates in CI), `ALERT_EMAIL_RECIPIENT`,
+the `SMTP_*` values and the `AIRFLOW_*` values (local runtime only). **CI never sends
+mail** — the notification settings live in the DAG, and CI never runs a DAG, so no SMTP
+credential is ever added to the repository secrets.
 
 GitHub injects secrets as environment variables on the job. `profiles.yml.example` is copied
 to `dbt/profiles.yml` on the runner and its `env_var()` calls resolve against them; nothing
@@ -1279,13 +1463,16 @@ trade-data-engineering-case-study/
 ├── .gitignore
 ├── .env.example
 │
-├── data/
-│   └── .gitkeep
+├── data/                          landing area, written by the generation DAG
+│   ├── trades_batch_NNN.json      waiting to be processed
+│   ├── .generation_progress       generator cycle checkpoint (git-ignored)
+│   └── archive/                   successfully processed
 │
 ├── data_generator/
-│   ├── generate_trades.py         batch generation CLI
+│   ├── generate_trades.py         batch generation CLI, one batch per run
 │   ├── trade_scenarios.py         scenario quotas and record builders
-│   └── ingest_trades.py           PUT + COPY INTO loader
+│   ├── ingest_trades.py           PUT + COPY INTO loader
+│   └── file_lifecycle.py          discovery + data/ -> archive/ move
 │
 ├── snowflake/
 │   └── sql/                       historical record of Phase 1 only.
@@ -1323,7 +1510,8 @@ trade-data-engineering-case-study/
 │
 ├── airflow/
 │   ├── dags/
-│   │   └── trade_pipeline.py      generate -> ingest -> dbt (+ notify_failure)
+│   │   ├── trade_data_generation.py   writes files into data/
+│   │   └── trade_pipeline.py          find -> ingest -> dbt -> archive
 │   ├── Dockerfile
 │   └── requirements.txt
 │
@@ -1337,11 +1525,12 @@ trade-data-engineering-case-study/
 ├── monitoring/
 │   ├── sql/
 │   │   └── monitoring.sql         V_PIPELINE_HEALTH + ALERT_PIPELINE_FAILURE
-│   └── send_failure_alert.py      called by the notify_failure task
+│   └── send_failure_alert.py      standalone CLI: the Snowflake email route
 │
 ├── tests/
 │   ├── test_trade_generator.py
 │   ├── test_ingestion_errors.py
+│   ├── test_file_lifecycle.py
 │   ├── test_send_failure_alert.py
 │   └── fixtures/
 │       └── trades_batch_999.json  deliberately malformed, for the bad-input test
@@ -1588,16 +1777,27 @@ downstream nodes are skipped, so GOLD is never corrupted. The pipeline fails clo
 
 ### Phase 7 — Monitoring + Alerting
 
-**Complete.** Deliberately small: one view, one alert, one Airflow task. See section 15
-for the full write-up.
+**Complete.** Deliberately small: one view, one alert. See section 15 for the full
+write-up.
+
+Airflow reports its own outcome by email, using the built-in `email_on_failure` (per task,
+via `default_args`) and one `on_success_callback` (per run, on the DAG). This replaced an
+earlier `notify_failure` watcher task that routed the mail through Snowflake: notification
+is now configuration rather than a node, so the graph keeps only the four tasks that do work
+and no task has to exit non-zero to keep a failed run red. Airflow's SMTP mailer is configured with
+`AIRFLOW__SMTP__*` in `docker-compose.yml`, so the project now does hold an SMTP credential
+in the gitignored `.env` — CI never sends mail and never receives one. The Snowflake objects
+below are separate — they watch the data, not the scheduler.
 
 | Delivered | Where |
 | --- | --- |
 | `TRADE_DB.MONITORING` schema | `terraform/main.tf` — 10th resource |
 | `V_PIPELINE_HEALTH` — daily health from COPY_HISTORY, QUERY_HISTORY and live GOLD | `monitoring/sql/monitoring.sql` |
 | `ALERT_PIPELINE_FAILURE` — emails on a failed load or dbt node, left suspended | `monitoring/sql/monitoring.sql` |
-| `TRADE_ALERT_EMAIL` notification integration — Snowflake sends the mail, no SMTP | `monitoring/sql/monitoring.sql` |
-| `notify_failure` task, `trigger_rule="one_failed"` | `airflow/dags/trade_pipeline.py` |
+| `TRADE_ALERT_EMAIL` notification integration — used by the data alert and the manual CLI | `monitoring/sql/monitoring.sql` |
+| `email_on_failure` for failures, one success callback — silent on a short-circuited run | `airflow/dags/trade_pipeline.py` |
+| `AIRFLOW__SMTP__*` configuration for Airflow's mailer | `docker-compose.yml`, `.env.example` |
+| `send_failure_alert.py` — standalone CLI, the Snowflake route, not called by the DAG | `monitoring/send_failure_alert.py` |
 | Administrative queries for loads, dbt runs, failures, cost, performance, table sizes | README section 15 |
 
 #### What was deliberately not built
@@ -1615,7 +1815,7 @@ for the full write-up.
 Verified: Terraform plan clean at 10 resources; the view returns a correct `DEGRADED` day
 for the real Phase 6 dbt failure; the alert exists, is suspended, and `EXECUTE ALERT`
 recorded `TRIGGERED` in `ALERT_HISTORY`; `SYSTEM$SEND_EMAIL` delivered; a controlled DAG
-failure ran `notify_failure` and left all six table counts unchanged.
+failure notified correctly and left all six table counts unchanged.
 
 ---
 

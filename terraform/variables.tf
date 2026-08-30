@@ -63,3 +63,9 @@ variable "raw_table_name" {
   type        = string
   default     = "RAW_TRADES"
 }
+
+variable "alert_email_recipient" {
+  description = "Verified email address allowed to receive Snowflake monitoring alerts."
+  type        = string
+  sensitive   = true
+}

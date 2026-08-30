@@ -38,7 +38,7 @@
 CREATE OR REPLACE NOTIFICATION INTEGRATION TRADE_ALERT_EMAIL
     TYPE = EMAIL
     ENABLED = TRUE
-    COMMENT = 'Delivers trade pipeline failure notifications. Used by ALERT_PIPELINE_FAILURE and by the Airflow notify_failure task.';
+    COMMENT = 'Delivers trade pipeline failure notifications. Used by ALERT_PIPELINE_FAILURE and by the standalone monitoring/send_failure_alert.py CLI. Airflow''s own DAG emails go over SMTP instead.';
 
 
 -- ---------------------------------------------------------------------------
@@ -141,7 +141,7 @@ ORDER BY 1 DESC;
 -- RAW_TRADES that did not load cleanly, or a dbt node that failed. Both are
 -- objective evidence that something ran and failed.
 --
--- This complements, rather than duplicates, the Airflow notify_failure task:
+-- This complements, rather than duplicates, the DAG's failure email:
 -- Airflow reports that a TASK failed, the alert reports that the OUTCOME in
 -- Snowflake is bad - including work Airflow never orchestrated, such as a manual
 -- `dbt build` or a direct load.

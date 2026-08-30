@@ -10,6 +10,7 @@ from datetime import date
 
 import pytest
 
+import generate_trades
 from trade_scenarios import BATCH_IDS, TRADE_FIELDS, build_batches
 
 
@@ -173,3 +174,105 @@ def test_same_version_resends_change_the_economics(batches):
             checked += 1
 
     assert checked == 30  # 15 + 10 + 5 across batches 002-004
+
+
+# --- One batch per invocation ---------------------------------------------
+
+# The generator writes a single batch per run and tracks the cycle in
+# data/.generation_progress. What matters is that the cycle advances, rolls
+# over, and still produces exactly the content build_batches() produces.
+
+# Small enough to keep the tests fast, large enough for BATCH_002/003's quotas.
+CYCLE_RECORDS = 60
+
+
+def _run(output_dir, records=CYCLE_RECORDS):
+    """Invoke the generator CLI once against a temporary data directory."""
+    return generate_trades.main(
+        [
+            "--output-dir",
+            str(output_dir),
+            "--records-per-batch",
+            str(records),
+            "--seed",
+            str(SEED),
+            "--as-of-date",
+            AS_OF.isoformat(),
+        ]
+    )
+
+
+def _batch_files(output_dir):
+    return sorted(path.name for path in output_dir.glob("trades_batch_*.json"))
+
+
+def test_each_invocation_writes_exactly_one_batch_and_the_cycle_rolls_over(tmp_path):
+    progress = tmp_path / generate_trades.PROGRESS_FILENAME
+
+    for position, batch_id in enumerate(BATCH_IDS, start=1):
+        assert _run(tmp_path) == 0
+        expected = generate_trades.batch_filename(batch_id)
+        assert _batch_files(tmp_path)[-1] == expected
+        assert len(_batch_files(tmp_path)) == position
+        assert generate_trades.read_progress(progress) == [
+            generate_trades.batch_filename(other) for other in BATCH_IDS[:position]
+        ]
+
+    # Fifth invocation starts the cycle again at BATCH_001.
+    assert _run(tmp_path) == 0
+    assert generate_trades.read_progress(progress) == [
+        generate_trades.batch_filename(BATCH_IDS[0])
+    ]
+
+
+def test_a_full_cycle_reproduces_the_all_at_once_content(tmp_path):
+    expected = build_batches(CYCLE_RECORDS, SEED, AS_OF)
+
+    for batch_id in BATCH_IDS:
+        _run(tmp_path)
+        written = json.loads(
+            (tmp_path / generate_trades.batch_filename(batch_id)).read_text(
+                encoding="utf-8"
+            )
+        )
+        assert written == expected[batch_id]
+
+
+def test_a_new_cycle_clears_archive_but_leaves_unprocessed_files_alone(tmp_path):
+    archive = tmp_path / generate_trades.ARCHIVE_DIRNAME
+    archive.mkdir()
+    (archive / "trades_batch_001.json").write_text("[]", encoding="utf-8")
+    waiting = tmp_path / "trades_batch_004.json"
+    waiting.write_text("[]", encoding="utf-8")
+
+    _run(tmp_path)  # count 0 -> new cycle
+
+    assert list(archive.iterdir()) == []
+    assert waiting.is_file()  # still waiting for the pipeline, untouched
+
+
+def test_a_missing_archive_directory_is_not_an_error(tmp_path):
+    assert not (tmp_path / generate_trades.ARCHIVE_DIRNAME).exists()
+    assert _run(tmp_path) == 0
+    assert _batch_files(tmp_path) == ["trades_batch_001.json"]
+
+
+@pytest.mark.parametrize(
+    "progress, expected",
+    [
+        ("", "trades_batch_001.json"),          # empty file
+        ("trades_batch_001.json\n", "trades_batch_002.json"),
+        ("trades_batch_001.json\ntrades_batch_002.json\n", "trades_batch_003.json"),
+        (
+            "trades_batch_001.json\ntrades_batch_002.json\ntrades_batch_003.json\n",
+            "trades_batch_004.json",
+        ),
+    ],
+)
+def test_a_partial_checkpoint_resumes_at_the_next_batch(tmp_path, progress, expected):
+    (tmp_path / generate_trades.PROGRESS_FILENAME).write_text(
+        progress, encoding="utf-8"
+    )
+
+    assert _run(tmp_path) == 0
+    assert _batch_files(tmp_path) == [expected]

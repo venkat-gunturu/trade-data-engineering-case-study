@@ -6,18 +6,32 @@ Flow, per batch file:
         -> PUT       -> TRADE_DB.RAW.TRADE_STAGE
         -> COPY INTO -> TRADE_DB.RAW.RAW_TRADES
 
-Airflow will call this script as a subprocess. The ingestion logic lives here
+Airflow calls this script as a subprocess. The ingestion logic lives here
 deliberately, not inside the DAG: Python owns ingestion, Airflow owns orchestration.
 
 RAW.RAW_TRADES is append-only. The source payload is stored unflattened in a
 VARIANT column; ingestion metadata (batch_id, source_file_name, ingested_at) is
 added alongside it.
 
+STAGE LIFECYCLE
+---------------
+PUT uses OVERWRITE = TRUE. Batch file names are reused across generation cycles
+- every cycle writes trades_batch_001.json again - so without OVERWRITE the
+second cycle's upload would be SKIPPED and would silently load the previous
+cycle's contents. Overwriting makes the stage match the file just read.
+
+The staged file is deliberately RETAINED after COPY INTO. It costs almost
+nothing and it leaves the exact bytes Snowflake loaded available for
+inspection, which is what you want when reconciling a load after the fact.
+
+If COPY INTO fails the file stays staged and nothing is committed, so a retry
+re-uploads and still loads correctly.
+
 Usage:
-    python ingest_trades.py                      # ingest every batch in data/
-    python ingest_trades.py --batch 001          # ingest a single batch
-    python ingest_trades.py --file ../data/x.json
-    python ingest_trades.py --force              # reload files already loaded
+    python ingest_trades.py                          # every batch waiting in data/
+    python ingest_trades.py --batch 001              # one batch by number
+    python ingest_trades.py --file ../data/a.json ../data/b.json
+    python ingest_trades.py --force                  # reload files already loaded
 """
 
 import argparse
@@ -26,6 +40,8 @@ import sys
 from pathlib import Path
 
 import snowflake.connector
+
+from file_lifecycle import DATA_DIR as LANDING_DIR, discover_files
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -98,9 +114,14 @@ def batch_id_for(local_file):
 
 
 def put_file(cursor, local_file):
-    """Upload the local JSON file to the named stage. Returns the staged file name."""
+    """Upload the local JSON file to the named stage. Returns the staged file name.
+
+    OVERWRITE = TRUE because batch file names repeat every generation cycle.
+    Without it PUT would report SKIPPED for a name already on the stage and the
+    load would take the previous cycle's bytes instead of the current file's.
+    """
     uri = local_file.resolve().as_posix()
-    cursor.execute(f"PUT 'file://{uri}' @{STAGE} AUTO_COMPRESS = TRUE OVERWRITE = TRUE")
+    cursor.execute(f"PUT 'file://{uri}' @{STAGE} OVERWRITE = TRUE, AUTO_COMPRESS = TRUE")
 
     results = rows_as_dicts(cursor)
     if not results:
@@ -160,8 +181,24 @@ def copy_into(cursor, staged_name, batch_id, force):
     return rows_loaded
 
 
+def remove_staged_file(cursor, staged_name):
+    """Drop a staged copy from the stage.
+
+    NOT part of the ingestion flow: staged files are retained on purpose, and
+    OVERWRITE = TRUE means a repeated file name is replaced rather than skipped,
+    so nothing has to be cleared for the next run to work. Kept as the supported
+    way to clear the stage by hand when it is being tidied up. Best-effort: a
+    failure here must never fail a load whose rows are already committed.
+    """
+    try:
+        cursor.execute(f"REMOVE @{STAGE}/{staged_name}")
+        print(f"  REMOVE    @{STAGE}/{staged_name}")
+    except snowflake.connector.Error as error:
+        print(f"  WARNING: could not remove {staged_name} from the stage: {error}")
+
+
 def ingest_file(cursor, local_file, force):
-    """PUT then COPY INTO a single batch file."""
+    """PUT then COPY INTO a single batch file. The staged copy is left in place."""
     if not local_file.is_file():
         raise IngestionError(f"Batch file not found: {local_file}")
 
@@ -169,18 +206,25 @@ def ingest_file(cursor, local_file, force):
     print(f"Ingesting {local_file.name} ({batch_id})")
 
     staged_name = put_file(cursor, local_file)
-    return copy_into(cursor, staged_name, batch_id, force)
+    rows_loaded = copy_into(cursor, staged_name, batch_id, force)
+    # The staged file is intentionally retained - see STAGE LIFECYCLE above.
+    return rows_loaded
 
 
 def resolve_files(args):
-    """Work out which batch files this run should ingest."""
+    """Work out which batch files this run should ingest.
+
+    With no arguments this is the file-driven path the DAG uses: whatever is
+    waiting directly in data/. Processed files live in data/archive/ and are
+    never rediscovered.
+    """
     if args.file:
-        return [Path(args.file)]
+        return [Path(path) for path in args.file]
 
     if args.batch:
-        return [DATA_DIR / f"trades_batch_{args.batch}.json"]
+        return [LANDING_DIR / f"trades_batch_{args.batch}.json"]
 
-    files = sorted(DATA_DIR.glob("trades_batch_*.json"))
+    files = discover_files(DATA_DIR)
     if not files:
         raise IngestionError(
             f"No batch files found in {DATA_DIR}. Run generate_trades.py first."
@@ -192,7 +236,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--batch", help="Batch number to ingest, e.g. 001")
-    group.add_argument("--file", help="Path to a specific JSON batch file")
+    group.add_argument(
+        "--file",
+        nargs="+",
+        help="One or more JSON batch files. The DAG passes the files it discovered.",
+    )
     parser.add_argument(
         "--force",
         action="store_true",

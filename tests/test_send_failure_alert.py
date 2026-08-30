@@ -118,3 +118,44 @@ def test_the_notification_uses_the_snowflake_integration(monkeypatch, recipient_
 
     assert captured["recipient"] == "someone@example.com"
     assert send_failure_alert.INTEGRATION == "TRADE_ALERT_EMAIL"
+
+
+# --- which task failed -----------------------------------------------------
+
+# The DAG no longer generates its own batch, so a failure can come from any of
+# find_files, ingest_trades, dbt_build or archive_files. The notification has to
+# say which.
+
+
+def test_the_message_names_the_failed_task():
+    args = send_failure_alert.parse_args(ARGV + ["--failed-tasks", "ingest_trades"])
+    subject, body = send_failure_alert.build_message(args)
+
+    assert "ingest_trades" in subject
+    assert "ingest_trades" in body
+
+
+def test_several_failed_tasks_are_all_reported():
+    args = send_failure_alert.parse_args(
+        ARGV + ["--failed-tasks", "ingest_trades,dbt_build"]
+    )
+    _, body = send_failure_alert.build_message(args)
+
+    assert "ingest_trades" in body
+    assert "dbt_build" in body
+
+
+def test_an_empty_task_list_is_reported_as_unknown_not_as_no_failure():
+    """This script only runs because something failed; silence would mislead."""
+    args = send_failure_alert.parse_args(ARGV)
+    subject, body = send_failure_alert.build_message(args)
+
+    assert "unknown" in subject
+    assert "unknown" in body
+    assert "trade_pipeline" in subject, "the run is still identified"
+
+
+def test_whitespace_and_empty_entries_are_ignored():
+    assert send_failure_alert.format_failed_tasks(" dbt_build , ") == "dbt_build"
+    assert send_failure_alert.format_failed_tasks(",,") .startswith("unknown")
+    assert send_failure_alert.format_failed_tasks("").startswith("unknown")

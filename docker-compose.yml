@@ -25,6 +25,20 @@ x-airflow-env: &airflow-env
   # by a host run on Windows makes dbt fail inside the Linux container.
   DBT_TARGET_PATH: /tmp/dbt_target
   DBT_LOG_PATH: /tmp/dbt_logs
+  # --- SMTP, for the DAG's failure and success emails ---
+  # Airflow's mailer reads this [smtp] section. Values are interpolated from the
+  # gitignored .env at the repository root, the same way AIRFLOW_SECRET_KEY above
+  # is. Port 587 means STARTTLS, so SMTP_SSL stays False; port 465 would be the
+  # other way round. Airflow masks smtp_password in the UI's Configuration page.
+  AIRFLOW__SMTP__SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+  AIRFLOW__SMTP__SMTP_PORT: ${SMTP_PORT:-587}
+  AIRFLOW__SMTP__SMTP_STARTTLS: ${SMTP_STARTTLS:-True}
+  AIRFLOW__SMTP__SMTP_SSL: 'False'
+  AIRFLOW__SMTP__SMTP_USER: ${SMTP_USER:-}
+  AIRFLOW__SMTP__SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+  AIRFLOW__SMTP__SMTP_MAIL_FROM: ${SMTP_MAIL_FROM:-}
+  AIRFLOW__SMTP__SMTP_TIMEOUT: '30'
+  AIRFLOW__SMTP__SMTP_RETRY_LIMIT: '3'
 
 x-airflow-common: &airflow-common
   build:
@@ -42,8 +56,11 @@ x-airflow-common: &airflow-common
     # so edits on the host take effect without rebuilding the image.
     - ./data_generator:/opt/airflow/project/data_generator
     - ./dbt:/opt/airflow/project/dbt
+    # The landing area the generation DAG writes to and the pipeline reads from,
+    # including data/archive/ once files have been processed.
     - ./data:/opt/airflow/project/data
-    # Failure notification script called by the notify_failure task.
+    # send_failure_alert.py, kept as a manual CLI for sending an alert through
+    # Snowflake by hand. The DAG emails over SMTP instead and never calls it.
     - ./monitoring:/opt/airflow/project/monitoring
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
