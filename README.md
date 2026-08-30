@@ -1120,26 +1120,130 @@ Terraform is the source of truth for all infrastructure.
 
 ## 17. CI/CD
 
-GitHub Actions will validate:
+Two GitHub Actions workflows. A pull request is validated automatically and can change
+nothing in Snowflake; deploying is a separate, manual, approved action.
 
 ```text
-Python
-dbt
-Terraform
+.github/workflows/ci.yml       pull requests + pushes to main
+.github/workflows/deploy.yml   manual only, gated by the production environment
 ```
 
-Validation will include appropriate checks such as:
+### `ci.yml` — what runs on every pull request
+
+**Job 1: `validate`** — no credentials, cannot reach Snowflake, about a minute.
+
+| Step | Check |
+| --- | --- |
+| Credential guard | Fails if `.env`, `profiles.yml`, `*.tfstate`, `*.tfvars`, `*.tfplan` or `.terraform/` is tracked |
+| `pytest tests/ -q` | 34 Python tests |
+| `dbt parse` | Resolves every model, `ref`, source, macro, generic test and unit test definition |
+| `terraform fmt -check -recursive` | Formatting |
+| `terraform init -backend=false` + `validate` | Syntax, types, provider schema |
+
+The Snowflake variables in this job are dummy strings on purpose. `dbt parse` needs them to
+render the `env_var()` calls in the profile but never opens a connection, so the job that
+runs on every push is *structurally* incapable of touching the warehouse. `dbt compile`
+would connect, which is why `parse` is the offline check and the real build happens below.
+
+**Job 2: `dbt-integration`** — a full `dbt build` against a throwaway copy of the database.
+
+```sql
+CREATE OR REPLACE DATABASE TRADE_DB_CI_<run_id> CLONE TRADE_DB;   -- zero-copy, instant
+dbt build            with SNOWFLAKE_DATABASE = TRADE_DB_CI_<run_id>
+DROP DATABASE TRADE_DB_CI_<run_id>;                               -- always, even on failure
+```
+
+This needed no change to the dbt project. `models/staging/sources.yml` already resolves its
+database from `SNOWFLAKE_DATABASE`, and so does the profile, so pointing that one variable
+at the clone moves the source *and* every model target with it. `TRADE_DB` is neither read
+nor written.
+
+Why a clone rather than a CI schema: `macros/generate_schema_name.sql` deliberately returns
+the custom schema name literally, so models always land in `BRONZE` / `SILVER` / `GOLD`.
+Isolating by database sidesteps that without touching a business macro. Snowflake's cloning
+is metadata-only, so it costs nothing in storage and completes in about a second.
+
+The clone carries whatever RAW holds, so CI is a real integration test rather than a smoke
+test — and every test also passes against an empty RAW, so **CI never depends on anyone
+having loaded the batch files**. The run id in the name means concurrent pull requests
+cannot collide, and the drop step runs `if: always()` so a red build leaves nothing behind.
+
+Verified locally before first push: clone carried 800 RAW rows, `dbt build` 63 nodes passed,
+`TRADE_STORE` 700 in the clone, database dropped, zero leftovers, `TRADE_DB` unchanged.
+
+### `deploy.yml` — deploying dbt to the real database
+
+Manual `workflow_dispatch` only, bound to a GitHub Environment named `production` with a
+required reviewer. Merging to `main` runs CI and changes nothing in Snowflake; deployment is
+a decision, and GitHub pauses for approval before the job starts.
+
+The job runs `dbt build --profiles-dir .` against `TRADE_DB`. It does not load data —
+that is the Airflow DAG's job — and it does not run Terraform.
+
+### Terraform: validated in CI, applied locally
+
+Terraform state lives at `terraform/terraform.tfstate` and is gitignored, which is correct:
+state describes real resources and must never be committed. The consequence is that a
+GitHub Actions runner starts with no state, so a `terraform plan` there would report
+"10 to add" — describing an empty account rather than yours — and `apply` would fail on
+objects that already exist.
+
+CI therefore runs the Terraform checks that are meaningful without state, and those happen
+to be the ones that need no credentials either. `plan` and `apply` stay local:
+
+```bash
+terraform -chdir=terraform plan     # review
+terraform -chdir=terraform apply    # then apply
+```
+
+This is a safety property rather than a shortcut: **no workflow in this repository has a
+path to `terraform apply`**, so no pull request, from any branch, can create, change or
+destroy infrastructure.
+
+Remote state is deliberately not introduced. The case study lists IaC as optional and says
+nothing about state management, and a remote backend would mean another cloud service, more
+secrets and a migration of working state, to enable something nothing here needs. If CI ever
+had to apply infrastructure, the change is one `backend` block in `providers.tf` plus
+`terraform init -migrate-state`.
+
+### Order when standing the project up from scratch
 
 ```text
-Python tests
-dbt compile
-dbt tests / validation
-Terraform fmt
-Terraform validate
-Terraform plan where appropriate
+terraform apply  (local)  ->  deploy.yml  (dbt build)  ->  Airflow DAG  (data)
+   database + 5 schemas        models inside them          batches into RAW
 ```
 
-Deployment will use secrets supplied through the GitHub environment rather than committed credentials.
+### GitHub Secrets
+
+Six repository secrets, taken straight from your local `.env`:
+
+| Secret | Used by |
+| --- | --- |
+| `SNOWFLAKE_ACCOUNT` | dbt profile, Snowflake connector |
+| `SNOWFLAKE_USER` | dbt profile, Snowflake connector |
+| `SNOWFLAKE_PASSWORD` | dbt profile, Snowflake connector |
+| `SNOWFLAKE_ROLE` | dbt profile, Snowflake connector |
+| `SNOWFLAKE_WAREHOUSE` | dbt profile, Snowflake connector |
+| `SNOWFLAKE_DATABASE` | deploy target; CI clones it and builds into the copy |
+
+Plain workflow configuration, not secrets: `DBT_TARGET_SCHEMA=BRONZE`, `DBT_THREADS=4`, and
+the CI clone name. These are naming, not credentials.
+
+Not needed by CI at all: `SNOWFLAKE_ORGANIZATION_NAME` and `SNOWFLAKE_ACCOUNT_NAME`
+(Terraform provider only, and Terraform never authenticates in CI), `ALERT_EMAIL_RECIPIENT`
+and the `AIRFLOW_*` values (local runtime only).
+
+GitHub injects secrets as environment variables on the job. `profiles.yml.example` is copied
+to `dbt/profiles.yml` on the runner and its `env_var()` calls resolve against them; nothing
+is written anywhere but the runner, which is destroyed when the job ends.
+
+One-time setup in the GitHub UI: add the six secrets under **Settings → Secrets and
+variables → Actions**, and create an environment named `production` under
+**Settings → Environments** with yourself as a required reviewer.
+
+If Snowflake ever refuses the CI password sign-in — MFA enforcement for password-based
+logins is tightening — the fix is key-pair authentication: one `SNOWFLAKE_PRIVATE_KEY`
+secret and two lines in the profile.
 
 ## 18. Security / Credentials
 
@@ -1248,8 +1352,10 @@ trade-data-engineering-case-study/
 ├── requirements.txt
 ├── docker-compose.yml
 │
-└── .github/                       Phase 8
+└── .github/
     └── workflows/
+        ├── ci.yml                 PR validation + dbt build on a DB clone
+        └── deploy.yml             manual, approved dbt deploy
 ```
 
 ## 20. Phase-by-Phase Implementation Plan
@@ -1515,17 +1621,30 @@ failure ran `notify_failure` and left all six table counts unchanged.
 
 ### Phase 8 — CI/CD
 
-GitHub Actions:
+**Complete.** Two workflow files. Full detail in section 17.
 
-```text
-Python validation
-      +
-dbt validation
-      +
-Terraform validation
-```
+| Delivered | Where |
+| --- | --- |
+| PR validation with no credentials: credential guard, pytest, `dbt parse`, `terraform fmt`/`validate` | `.github/workflows/ci.yml`, job `validate` |
+| Full `dbt build` against a zero-copy clone of `TRADE_DB`, dropped afterwards | `.github/workflows/ci.yml`, job `dbt-integration` |
+| Manual, approval-gated dbt deploy | `.github/workflows/deploy.yml` |
+| Six GitHub Secrets, no committed credentials | README section 17 |
 
-Then add deployment workflow where appropriate.
+Three decisions worth stating:
+
+- **CI isolates by database, not by schema.** `generate_schema_name` returns the schema name
+  literally, so models always land in BRONZE/SILVER/GOLD. Cloning the database moves the
+  source and every target together, because `sources.yml` and the profile both read
+  `SNOWFLAKE_DATABASE` — so CI isolation needed no change to the dbt project.
+- **No `terraform apply` exists anywhere in CI.** State is local, so CI validates the
+  configuration and apply stays a local operation. That is also what makes a pull request
+  structurally unable to change infrastructure.
+- **Deployment is manual and approved**, not automatic on merge. A README merge should not
+  queue a warehouse rebuild.
+
+Verified before first push: clone carried 800 RAW rows, `dbt build` 63 nodes passed inside
+the clone, `TRADE_STORE` 700 there, clone dropped with zero leftovers, and `TRADE_DB` plus
+the Phase 7 alert unchanged.
 
 ---
 
@@ -1652,10 +1771,10 @@ Phase 4   ██████████  Airflow + Docker orchestration
 Phase 5   ██████████  Terraform IaC (10 resources created from scratch)
 Phase 6   ██████████  Testing + Data Quality (rules verified in Snowflake)
 Phase 7   ██████████  Monitoring + Alerting (1 view, 1 alert, 1 Airflow task)
-Phase 8   ░░░░░░░░░░  Next: CI/CD
-Phase 9   ░░░░░░░░░░
+Phase 8   ██████████  CI/CD (GitHub Actions: PR validation + gated dbt deploy)
+Phase 9   ░░░░░░░░░░  Next: Documentation + final submission
 ```
 
-**Next implementation step:** Phase 8 — CI/CD with GitHub Actions to validate and deploy dbt and Terraform.
+**Next implementation step:** Phase 9 — architecture diagram, setup and execution guide, and the final documentation pass.
 
 Deferred by decision, each to its own pass: the optional custom trade rules (section 12); run-scoped stage paths to make RAW append-idempotent; an incremental `TRADE_STORE` and append-only `REJECTED_TRADES`; splitting `dbt build` into `dbt run` and `dbt test`; late-arriving dimensions; and the scalability design for a 10,000x increase in volume.
