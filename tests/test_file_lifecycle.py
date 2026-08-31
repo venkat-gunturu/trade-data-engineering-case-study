@@ -200,27 +200,35 @@ def test_put_overwrites_the_staged_file():
     assert "OVERWRITE = TRUE" in puts[0].upper()
 
 
-def test_the_staged_file_is_kept_after_a_successful_load(tmp_path, monkeypatch):
-    """Staged files are retained for visibility, so nothing may clear them.
-
-    Asserted two ways: the helper is not called, and no REMOVE reaches the
-    cursor by any other route.
-    """
+def test_the_staged_file_is_kept_after_a_successful_load(tmp_path):
+    """Staged files are retained for visibility, so nothing may clear them."""
     import ingest_trades
 
     batch = tmp_path / "trades_batch_001.json"
     batch.write_text("[]", encoding="utf-8")
 
-    removals = []
-    monkeypatch.setattr(
-        ingest_trades, "remove_staged_file", lambda *args: removals.append(args)
-    )
-
     cursor = _RecordingCursor()
     assert ingest_trades.ingest_file(cursor, batch, force=False) == 3
 
-    assert removals == [], "remove_staged_file must not be called by ingest_file"
     assert _statements_matching(cursor, "REMOVE") == [], "no REMOVE may be issued"
+
+
+def test_a_loaded_file_is_recorded_in_the_control_table(tmp_path):
+    """One LOAD_CONTROL row per file, keyed by the staged name RAW_TRADES carries."""
+    import ingest_trades
+
+    batch = tmp_path / "trades_batch_001.json"
+    batch.write_text("[]", encoding="utf-8")
+
+    cursor = _RecordingCursor()
+    ingest_trades.ingest_file(cursor, batch, force=False)
+
+    inserts = _statements_matching(cursor, "INSERT INTO")
+    assert len(inserts) == 1, "exactly one control row per file"
+    statement = inserts[0].upper()
+    assert "LOAD_CONTROL" in statement
+    assert "'TRADES_BATCH_001.JSON.GZ'" in statement
+    assert "'LOADED'" in statement
 
 
 def test_the_loader_defaults_to_whatever_is_waiting_in_data(monkeypatch, tmp_path):

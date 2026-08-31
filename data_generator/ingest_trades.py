@@ -5,6 +5,7 @@ Flow, per batch file:
     local JSON file
         -> PUT       -> TRADE_DB.RAW.TRADE_STAGE
         -> COPY INTO -> TRADE_DB.RAW.RAW_TRADES
+        -> INSERT    -> TRADE_DB.MONITORING.LOAD_CONTROL   (one row per file)
 
 Airflow calls this script as a subprocess. The ingestion logic lives here
 deliberately, not inside the DAG: Python owns ingestion, Airflow owns orchestration.
@@ -51,6 +52,7 @@ ENV_FILE = PROJECT_ROOT / ".env"
 STAGE = "TRADE_DB.RAW.TRADE_STAGE"
 TARGET_TABLE = "TRADE_DB.RAW.RAW_TRADES"
 FILE_FORMAT = "TRADE_DB.RAW.JSON_FILE_FORMAT"
+CONTROL_TABLE = "TRADE_DB.MONITORING.LOAD_CONTROL"
 
 REQUIRED_ENV_VARS = (
     "SNOWFLAKE_ACCOUNT",
@@ -181,20 +183,24 @@ def copy_into(cursor, staged_name, batch_id, force):
     return rows_loaded
 
 
-def remove_staged_file(cursor, staged_name):
-    """Drop a staged copy from the stage.
+def upd_control_table(cursor, staged_name):
+    """Record one LOAD_CONTROL row for the file just loaded.
 
-    NOT part of the ingestion flow: staged files are retained on purpose, and
-    OVERWRITE = TRUE means a repeated file name is replaced rather than skipped,
-    so nothing has to be cleared for the next run to work. Kept as the supported
-    way to clear the stage by hand when it is being tidied up. Best-effort: a
-    failure here must never fail a load whose rows are already committed.
+    One row per file, whatever its row count, so the control table answers
+    "was this file loaded?" without going near ACCOUNT_USAGE. FILENAME holds
+    the staged name - the same value RAW_TRADES.SOURCE_FILE_NAME carries from
+    METADATA$FILENAME - so a control row joins straight to the rows it covers.
+
+    Not best-effort: a failed INSERT fails the task, because a missing control
+    row means the ledger disagrees with what is actually in RAW_TRADES.
     """
-    try:
-        cursor.execute(f"REMOVE @{STAGE}/{staged_name}")
-        print(f"  REMOVE    @{STAGE}/{staged_name}")
-    except snowflake.connector.Error as error:
-        print(f"  WARNING: could not remove {staged_name} from the stage: {error}")
+    cursor.execute(
+        f"""
+        INSERT INTO {CONTROL_TABLE} (filename, ingested_at, status)
+        SELECT '{staged_name}', CURRENT_TIMESTAMP(), 'LOADED'
+        """
+    )
+    print(f"  CONTROL   {CONTROL_TABLE}: {staged_name} LOADED")
 
 
 def ingest_file(cursor, local_file, force):
@@ -207,6 +213,7 @@ def ingest_file(cursor, local_file, force):
 
     staged_name = put_file(cursor, local_file)
     rows_loaded = copy_into(cursor, staged_name, batch_id, force)
+    upd_control_table(cursor, staged_name)
     # The staged file is intentionally retained - see STAGE LIFECYCLE above.
     return rows_loaded
 

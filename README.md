@@ -722,9 +722,6 @@ SMTP_MAIL_FROM                           the sender address
 ALERT_EMAIL_RECIPIENT                    who receives the mail
 ```
 
-**Gmail needs an App Password**, not your account password: enable 2-Step
-Verification, then generate a 16-character App Password at *myaccount.google.com
-→ Security → App passwords*. Your normal password fails with SMTP error `535`.
 `.env` is gitignored; only `.env.example` is committed, and CI never sends mail
 (section 17).
 
@@ -732,7 +729,70 @@ Verification, then generate a 16-character App Password at *myaccount.google.com
 15, which requires a **verified** email address of a user in your Snowflake
 account (Snowsight → profile → verify email). Use an address that satisfies both.
 
-Two behaviours worth knowing:
+#### Setup steps (do these once, before the first email will arrive)
+
+1. **Enable 2-Step Verification** on the Gmail account:
+   *myaccount.google.com → Security → 2-Step Verification*. App Passwords do
+   not exist as an option until this is on.
+
+2. **Generate a 16-character App Password**: *myaccount.google.com → Security →
+   App passwords*. Google displays it grouped as `abcd efgh ijkl mnop`.
+   **Remove the spaces** when pasting into `.env` — Compose passes the value
+   through verbatim, and a password containing spaces fails authentication.
+   Your normal Gmail password will NOT work; it fails with SMTP error `535`.
+
+3. **Set `SMTP_MAIL_FROM` equal to `SMTP_USER`.** Gmail refuses to send with a
+   `From` address the authenticated account does not own or have as a verified
+   alias. An invented sender such as `airflow-alerts@gmail.com` produces
+   `SMTPSenderRefused` even when the credentials are perfectly valid.
+
+4. **Recreate the containers.** `docker-compose.yml` interpolates `${SMTP_*}`
+   from `.env` at container-*create* time, so a running container keeps whatever
+   the values were when it started:
+
+   ```bash
+   docker compose up -d          # detects the .env change and recreates
+   ```
+
+   `docker compose restart` is **not** sufficient — it reuses the container's
+   existing environment and silently leaves the old (or empty) values in place.
+
+5. **Verify without waiting for a DAG run:**
+
+   ```bash
+   docker exec <project>-airflow-scheduler-1 sh -c 'env | grep AIRFLOW__SMTP'
+   ```
+
+   `SMTP_USER`, `SMTP_PASSWORD` and `SMTP_MAIL_FROM` must all be non-empty. Then
+   send a test message through Airflow's own mailer:
+
+   ```bash
+   docker exec <project>-airflow-scheduler-1 python -c \
+     "from airflow.utils.email import send_email; \
+      send_email(to=['you@example.com'], subject='Airflow SMTP test', \
+                 html_content='<p>SMTP works.</p>')"
+   ```
+
+   Success logs `Sent an alert email to [...]` with no traceback. `535` means the
+   App Password is wrong or still contains spaces; `530 Authentication Required`
+   means the credentials never reached the container — go back to step 4.
+
+#### Where SMTP errors appear
+
+`send_dag_success_email` is a **DAG-level** `on_success_callback`, executed by the
+DAG file processor rather than by a task. Airflow catches and logs its exceptions,
+and the DAG run still reports **success** — so a broken mailer is invisible in the
+UI and absent from every task log. Tracebacks land in:
+
+```text
+airflow/logs/scheduler/<date>/trade_pipeline.py.log
+```
+
+Search that file for `SMTPSenderRefused` or `failed to invoke dag state update
+callback`. The `email_on_failure` path is ordinary task-level behaviour and does
+log into the task's own log.
+
+#### Two behaviours worth knowing
 
 - **The failure email fires once, not three times.** `retries = 2` means a task
   with retries left goes to `up_for_retry`, not `failed`, and only `failed`

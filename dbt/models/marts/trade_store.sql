@@ -1,62 +1,74 @@
-{#
-    GOLD: current state of each trade. Exactly one row per trade_id.
+{{ config
+    (
+        materialized='incremental',
+        incremental_strategy='merge',
+        unique_key='trade_id',
+        post_hook=["update {{ this }} set set status = 'EXPIRED' where maturity_date < current_date and status != 'EXPIRED'"]
+    ) 
+}}
+with source_data as (
 
-    Rule 2 (same version replaces) falls out of the ordering rather than needing
-    its own branch: among accepted records the winner is the highest version,
-    then the latest event_timestamp, then the highest surrogate_key. A
-    same-version re-send always carries a later event_timestamp, so it replaces
-    the record it supersedes.
-
-    Rule 1 needs nothing here - lower-version records were already rejected in
-    SILVER and never reach this model, so they cannot displace the current record.
-
-    Rule 4 (expiration) is applied here, against CURRENT_DATE, so a stored trade
-    flips to EXPIRED as soon as its maturity date passes.
-
-    No SCD2 / history in this phase: superseded versions remain visible in
-    SILVER and in RAW, but the store holds current state only.
-#}
-
-with accepted as (
-
-    select *
+    select 
+    *
     from {{ ref('int_trade_validation') }}
-    where validation_status = 'ACCEPTED'
 
 ),
+existing_trades as (
 
-ranked as (
+    {% if is_incremental() %}
 
     select
-        *,
-        row_number() over (
-            partition by trade_id
-            order by trade_version desc, event_timestamp desc, surrogate_key desc
-        ) as current_record_rank
-    from accepted
-
+        trade_id,
+        trade_version,
+        trade_type,
+        instrument_type,
+        counterparty,
+        trade_date,
+        event_timestamp,
+        maturity_date,
+        notional_amount,
+        currency,
+        price,
+        quantity,
+        status,
+        updated_timestamp
+    from {{ this }}
+    {% else %}
+    select
+        cast(null as varchar) as trade_id,
+        cast(null as number) as trade_version,
+        cast(null as varchar) as trade_type,
+        cast(null as varchar) as instrument_type,
+        cast(null as varchar) as counterparty,
+        cast(null as date) as trade_date,
+        cast(null as timestamp) as event_timestamp,
+        cast(null as date) as maturity_date,
+        cast(null as number) as notional_amount,
+        cast(null as varchar) as currency,
+        cast(null as number) as price,
+        cast(null as number) as quantity,
+        cast(null as varchar) as status,
+        cast(null as timestamp) as updated_timestamp
+    where false
+    {% endif %}
 )
-
-select
-    trade_id,
-    trade_version,
-    trade_type,
-    instrument_type,
-    counterparty,
-    trade_date,
-    event_timestamp,
-    maturity_date,
-    notional_amount,
-    currency,
-    price,
-    quantity,
-
-    case
-        when maturity_date < current_date() then 'EXPIRED'
-        else 'VALID'
-    end                                  as status,
-
-    current_timestamp()::timestamp_ntz   as updated_timestamp
-
-from ranked
-where current_record_rank = 1
+select 
+    coalesce(s.trade_id, e.trade_id) as trade_id,
+    s.trade_version,
+    coalesce(e.trade_type, s.trade_type) as trade_type,
+    coalesce(e.instrument_type, s.instrument_type) as instrument_type,
+    coalesce(e.counterparty, s.counterparty) as counterparty,
+    coalesce(e.trade_date, s.trade_date) as trade_date,
+    coalesce(e.event_timestamp, s.event_timestamp) as event_timestamp,
+    coalesce(e.maturity_date, s.maturity_date) as maturity_date,
+    coalesce(e.notional_amount, s.notional_amount) as notional_amount,
+    coalesce(e.currency, s.currency) as currency,
+    coalesce(e.price, s.price) as price,
+    coalesce(e.quantity, s.quantity) as quantity,
+    case when coalesce(e.maturity_date, s.maturity_date) < current_date then 'Expired' else coalesce(e.status, 'VALID') end as status,
+    coalesce(e.updated_timestamp, current_timestamp()) as updated_timestamp
+from source_data s
+left join existing_trades e
+on s.trade_id = e.trade_id
+where e.trade_id is null
+or s.trade_version >= e.trade_version

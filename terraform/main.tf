@@ -153,3 +153,45 @@ resource "snowflake_table" "raw_trades" {
     }
   }
 }
+
+resource "snowflake_table" "load_control" {
+  database = snowflake_database.trade_db.name
+  schema   = snowflake_schema.monitoring.name
+  name     = var.load_control_name
+  comment  = "Manages the load data"
+
+  data_retention_time_in_days = 1
+
+  column {
+    name     = "ID"
+    type     = "NUMBER(38,0)"
+    nullable = true
+
+    identity {
+      start_num = 1
+      step_num  = 1
+    }
+  }
+
+  column {
+    name     = "FILENAME"
+    type     = "VARCHAR(100)"
+    nullable = false
+  }
+
+  column {
+    name     = "INGESTED_AT"
+    type     = "TIMESTAMP_NTZ(9)"
+    nullable = true
+
+    default {
+      expression = "CURRENT_TIMESTAMP()"
+    }
+  }
+
+  column {
+    name     = "STATUS"
+    type     = "VARCHAR(100)"
+    nullable = false
+  }
+}
