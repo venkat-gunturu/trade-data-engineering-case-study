@@ -3,7 +3,7 @@
         materialized='incremental',
         incremental_strategy='merge',
         unique_key='trade_id',
-        post_hook=["update {{ this }} set set status = 'EXPIRED' where maturity_date < current_date and status != 'EXPIRED'"]
+        post_hook=["update {{ this }} set status = 'EXPIRED' where maturity_date < current_date and status != 'EXPIRED'"]
     ) 
 }}
 with source_data as (
@@ -11,6 +11,7 @@ with source_data as (
     select 
     *
     from {{ ref('int_trade_validation') }}
+    where validation_status = 'ACCEPTED'
 
 ),
 existing_trades as (
@@ -33,6 +34,7 @@ existing_trades as (
         status,
         updated_timestamp
     from {{ this }}
+    where status = 'VALID'
     {% else %}
     select
         cast(null as varchar) as trade_id,
@@ -53,20 +55,20 @@ existing_trades as (
     {% endif %}
 )
 select 
-    coalesce(s.trade_id, e.trade_id) as trade_id,
+    s.trade_id,
     s.trade_version,
-    coalesce(e.trade_type, s.trade_type) as trade_type,
-    coalesce(e.instrument_type, s.instrument_type) as instrument_type,
-    coalesce(e.counterparty, s.counterparty) as counterparty,
-    coalesce(e.trade_date, s.trade_date) as trade_date,
-    coalesce(e.event_timestamp, s.event_timestamp) as event_timestamp,
-    coalesce(e.maturity_date, s.maturity_date) as maturity_date,
-    coalesce(e.notional_amount, s.notional_amount) as notional_amount,
-    coalesce(e.currency, s.currency) as currency,
-    coalesce(e.price, s.price) as price,
-    coalesce(e.quantity, s.quantity) as quantity,
-    case when coalesce(e.maturity_date, s.maturity_date) < current_date then 'Expired' else coalesce(e.status, 'VALID') end as status,
-    coalesce(e.updated_timestamp, current_timestamp()) as updated_timestamp
+    s.trade_type,
+    s.instrument_type,
+    s.counterparty,
+    s.trade_date,
+    s.event_timestamp,
+    s.maturity_date,
+    s.notional_amount,
+    s.currency,
+    s.price,
+    s.quantity,
+    case when coalesce(e.maturity_date, s.maturity_date) < current_date then 'EXPIRED' else coalesce(e.status, 'VALID') end as status,
+    current_timestamp() as updated_timestamp
 from source_data s
 left join existing_trades e
 on s.trade_id = e.trade_id

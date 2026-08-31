@@ -69,6 +69,7 @@ with DAG(
     start_date=datetime(2026, 1, 1),
     schedule="*/30 * * * *",
     catchup=False,
+    default_args=default_args,
     max_active_runs=1,
     on_success_callback=send_dag_success_email,
     params={

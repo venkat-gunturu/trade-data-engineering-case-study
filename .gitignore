@@ -18,8 +18,11 @@ profiles.yml
 airflow/logs/
 airflow/plugins/
 
-# Generator checkpoint
+# Generated trade batches and processed output. data/ is a runtime
+# landing area, not repository content. tests/fixtures/ is committed.
 data/.generation_progress
+data/*.json
+data/archive/
 
 # Test artefacts
 .pytest_cache/
