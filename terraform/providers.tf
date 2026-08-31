@@ -42,5 +42,6 @@ provider "snowflake" {
   preview_features_enabled = [
     "snowflake_table_resource",
     "snowflake_file_format_json_resource",
+    "snowflake_email_notification_integration_resource",
   ]
 }

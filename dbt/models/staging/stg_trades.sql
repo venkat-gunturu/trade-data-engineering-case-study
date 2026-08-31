@@ -1,11 +1,6 @@
-{#
-    BRONZE: extract the trade attributes from the RAW VARIANT payload and cast
-    them to the agreed relational types.
-
-    Extraction and casting only - no business logic. Exactly one output row per
-    RAW row, so surrogate_key stays unique here and downstream.
-#}
-
+{{ config(
+    post_hook="UPDATE trade_db.monitoring.load_control SET STATUS='COMPLETED' WHERE STATUS='LOADED'"
+)}}
 select
     payload:trade_id::varchar(50)            as trade_id,
     payload:trade_version::number(10,0)      as trade_version,
@@ -20,11 +15,10 @@ select
     payload:price::number(18,6)              as price,
     payload:quantity::number(18,6)           as quantity,
     payload:trade_status::varchar(30)        as trade_status,
-
-    -- ingestion metadata, carried through unchanged
     surrogate_key,
     batch_id,
     source_file_name,
     ingested_at
-
 from {{ source('raw', 'raw_trades') }}
+where source_file_name in (
+select filename from trade_db.monitoring.load_control where status='LOADED')

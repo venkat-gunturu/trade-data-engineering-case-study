@@ -5,19 +5,34 @@ Flow, per batch file:
     local JSON file
         -> PUT       -> TRADE_DB.RAW.TRADE_STAGE
         -> COPY INTO -> TRADE_DB.RAW.RAW_TRADES
+        -> INSERT    -> TRADE_DB.MONITORING.LOAD_CONTROL   (one row per file)
 
-Airflow will call this script as a subprocess. The ingestion logic lives here
+Airflow calls this script as a subprocess. The ingestion logic lives here
 deliberately, not inside the DAG: Python owns ingestion, Airflow owns orchestration.
 
 RAW.RAW_TRADES is append-only. The source payload is stored unflattened in a
 VARIANT column; ingestion metadata (batch_id, source_file_name, ingested_at) is
 added alongside it.
 
+STAGE LIFECYCLE
+---------------
+PUT uses OVERWRITE = TRUE. Batch file names are reused across generation cycles
+- every cycle writes trades_batch_001.json again - so without OVERWRITE the
+second cycle's upload would be SKIPPED and would silently load the previous
+cycle's contents. Overwriting makes the stage match the file just read.
+
+The staged file is deliberately RETAINED after COPY INTO. It costs almost
+nothing and it leaves the exact bytes Snowflake loaded available for
+inspection, which is what you want when reconciling a load after the fact.
+
+If COPY INTO fails the file stays staged and nothing is committed, so a retry
+re-uploads and still loads correctly.
+
 Usage:
-    python ingest_trades.py                      # ingest every batch in data/
-    python ingest_trades.py --batch 001          # ingest a single batch
-    python ingest_trades.py --file ../data/x.json
-    python ingest_trades.py --force              # reload files already loaded
+    python ingest_trades.py                          # every batch waiting in data/
+    python ingest_trades.py --batch 001              # one batch by number
+    python ingest_trades.py --file ../data/a.json ../data/b.json
+    python ingest_trades.py --force                  # reload files already loaded
 """
 
 import argparse
@@ -27,6 +42,8 @@ from pathlib import Path
 
 import snowflake.connector
 
+from file_lifecycle import DATA_DIR as LANDING_DIR, discover_files
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
@@ -35,6 +52,7 @@ ENV_FILE = PROJECT_ROOT / ".env"
 STAGE = "TRADE_DB.RAW.TRADE_STAGE"
 TARGET_TABLE = "TRADE_DB.RAW.RAW_TRADES"
 FILE_FORMAT = "TRADE_DB.RAW.JSON_FILE_FORMAT"
+CONTROL_TABLE = "TRADE_DB.MONITORING.LOAD_CONTROL"
 
 REQUIRED_ENV_VARS = (
     "SNOWFLAKE_ACCOUNT",
@@ -98,9 +116,14 @@ def batch_id_for(local_file):
 
 
 def put_file(cursor, local_file):
-    """Upload the local JSON file to the named stage. Returns the staged file name."""
+    """Upload the local JSON file to the named stage. Returns the staged file name.
+
+    OVERWRITE = TRUE because batch file names repeat every generation cycle.
+    Without it PUT would report SKIPPED for a name already on the stage and the
+    load would take the previous cycle's bytes instead of the current file's.
+    """
     uri = local_file.resolve().as_posix()
-    cursor.execute(f"PUT 'file://{uri}' @{STAGE} AUTO_COMPRESS = TRUE OVERWRITE = TRUE")
+    cursor.execute(f"PUT 'file://{uri}' @{STAGE} OVERWRITE = TRUE, AUTO_COMPRESS = TRUE")
 
     results = rows_as_dicts(cursor)
     if not results:
@@ -160,8 +183,28 @@ def copy_into(cursor, staged_name, batch_id, force):
     return rows_loaded
 
 
+def upd_control_table(cursor, staged_name):
+    """Record one LOAD_CONTROL row for the file just loaded.
+
+    One row per file, whatever its row count, so the control table answers
+    "was this file loaded?" without going near ACCOUNT_USAGE. FILENAME holds
+    the staged name - the same value RAW_TRADES.SOURCE_FILE_NAME carries from
+    METADATA$FILENAME - so a control row joins straight to the rows it covers.
+
+    Not best-effort: a failed INSERT fails the task, because a missing control
+    row means the ledger disagrees with what is actually in RAW_TRADES.
+    """
+    cursor.execute(
+        f"""
+        INSERT INTO {CONTROL_TABLE} (filename, ingested_at, status)
+        SELECT '{staged_name}', CURRENT_TIMESTAMP(), 'LOADED'
+        """
+    )
+    print(f"  CONTROL   {CONTROL_TABLE}: {staged_name} LOADED")
+
+
 def ingest_file(cursor, local_file, force):
-    """PUT then COPY INTO a single batch file."""
+    """PUT then COPY INTO a single batch file. The staged copy is left in place."""
     if not local_file.is_file():
         raise IngestionError(f"Batch file not found: {local_file}")
 
@@ -169,18 +212,26 @@ def ingest_file(cursor, local_file, force):
     print(f"Ingesting {local_file.name} ({batch_id})")
 
     staged_name = put_file(cursor, local_file)
-    return copy_into(cursor, staged_name, batch_id, force)
+    rows_loaded = copy_into(cursor, staged_name, batch_id, force)
+    upd_control_table(cursor, staged_name)
+    # The staged file is intentionally retained - see STAGE LIFECYCLE above.
+    return rows_loaded
 
 
 def resolve_files(args):
-    """Work out which batch files this run should ingest."""
+    """Work out which batch files this run should ingest.
+
+    With no arguments this is the file-driven path the DAG uses: whatever is
+    waiting directly in data/. Processed files live in data/archive/ and are
+    never rediscovered.
+    """
     if args.file:
-        return [Path(args.file)]
+        return [Path(path) for path in args.file]
 
     if args.batch:
-        return [DATA_DIR / f"trades_batch_{args.batch}.json"]
+        return [LANDING_DIR / f"trades_batch_{args.batch}.json"]
 
-    files = sorted(DATA_DIR.glob("trades_batch_*.json"))
+    files = discover_files(DATA_DIR)
     if not files:
         raise IngestionError(
             f"No batch files found in {DATA_DIR}. Run generate_trades.py first."
@@ -192,7 +243,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--batch", help="Batch number to ingest, e.g. 001")
-    group.add_argument("--file", help="Path to a specific JSON batch file")
+    group.add_argument(
+        "--file",
+        nargs="+",
+        help="One or more JSON batch files. The DAG passes the files it discovered.",
+    )
     parser.add_argument(
         "--force",
         action="store_true",

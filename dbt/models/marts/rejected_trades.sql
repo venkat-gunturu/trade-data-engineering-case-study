@@ -1,35 +1,37 @@
-{#
-    GOLD: audit trail for compliance (rule 5).
-
-    Every rejected record is preserved with its original trade attributes, the
-    rejection reason, and the ingestion metadata needed to trace it back to the
-    source file and batch.
-
-    A trade_id may legitimately appear in BOTH this table and TRADE_STORE: a
-    stale lower-version message is rejected here while the newer version remains
-    current in the store. That is expected, so no mutual-exclusivity test exists.
-#}
-
+{{ config(
+    materialized='incremental',
+    incremental_strategy='append'
+) }}
 select
-    trade_id,
-    trade_version,
-    trade_type,
-    instrument_type,
-    counterparty,
-    trade_date,
-    event_timestamp,
-    maturity_date,
-    notional_amount,
-    currency,
-    price,
-    quantity,
+    s.trade_id,
+    s.trade_version,
+    s.trade_type,
+    s.instrument_type,
+    s.counterparty,
+    s.trade_date,
+    s.event_timestamp,
+    s.maturity_date,
+    s.notional_amount,
+    s.currency,
+    s.price,
+    s.quantity,
+    'LOWER_VERSION' as rejection_reason,
+    s.processed_at    as rejected_at,
+    s.source_file_name,
+    s.ingested_at,
+    s.batch_id
+from {{ ref('int_trade_validation') }} s
+join {{ ref('trade_store') }} t
+    on s.trade_id = t.trade_id
+where s.trade_version < t.trade_version
 
-    rejection_reason,
-    processed_at    as rejected_at,
+{% if is_incremental() %}
 
-    source_file_name,
-    ingested_at,
-    batch_id
+and not exists (
+    select 1
+    from {{ this }} r
+    where r.trade_id = s.trade_id
+      and r.trade_version = s.trade_version
+)
 
-from {{ ref('int_trade_validation') }}
-where validation_status = 'REJECTED'
+{% endif %}

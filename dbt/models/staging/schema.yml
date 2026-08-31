@@ -3,8 +3,8 @@ version: 2
 models:
   - name: stg_trades
     description: >
-      Relational projection of RAW.RAW_TRADES.payload. Extraction and casting
-      only; one row per RAW row.
+      Relational projection of payload from RAW.RAW_TRADES table. 
+      Extraction and casting only; one row per RAW row.
     columns:
       - name: surrogate_key
         description: Inherited from RAW; one row per RAW row.
@@ -18,7 +18,7 @@ models:
         tests:
           - not_null
       - name: maturity_date
-        description: Required by rules 3 and 4.
+        description: Trade maturity date, used for settlement and risk calculations.
         tests:
           - not_null
       - name: event_timestamp

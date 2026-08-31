@@ -1,0 +1,106 @@
+@startuml trade_pipeline_architecture
+' Trade Data Engineering Case Study - end-to-end pipeline flow.
+' Renders at https://www.plantuml.com/plantuml or with the PlantUML VS Code extension.
+
+title Trade Pipeline — End-to-End Flow
+
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam ArrowColor #4A5568
+skinparam ActivityBackgroundColor #EDF2F7
+skinparam ActivityBorderColor #4A5568
+skinparam ActivityDiamondBackgroundColor #FEFCBF
+skinparam NoteBackgroundColor #FFFFFF
+skinparam PartitionBorderColor #A0AEC0
+
+|#F7FAFC|Terraform (one-off)|
+start
+:terraform apply;
+note right
+  TRADE_DB
+  schemas RAW / BRONZE / SILVER / GOLD / MONITORING
+  TRADE_WH warehouse
+  JSON_FILE_FORMAT + TRADE_STAGE
+  RAW.RAW_TRADES, MONITORING.LOAD_CONTROL
+end note
+:run monitoring/sql/monitoring.sql;
+note right
+  TRADE_ALERT_EMAIL integration
+  V_PIPELINE_HEALTH view
+  ALERT_PIPELINE_FAILURE alert
+  (not Terraform-managed)
+end note
+
+|#EBF8FF|DAG: trade_data_generation|
+:generate_trades.py;
+:data/trades_batch_NNN.json;
+note right
+  One batch per run.
+  Cycle tracked in
+  data/.generation_progress
+end note
+
+|#E6FFFA|DAG: trade_pipeline (*/30 * * * *)|
+:find_files — glob data/trades_batch_*.json;
+if (any files waiting?) then (no)
+  :skip downstream tasks;
+  #D1FAE5:DAG run = SUCCESS;
+  stop
+else (yes)
+endif
+
+:ingest_trades.py;
+
+|#FFF5F7|Snowflake TRADE_DB|
+:PUT file -> RAW.TRADE_STAGE  (OVERWRITE, staged copy retained);
+:COPY INTO RAW.RAW_TRADES  (VARIANT payload, append-only);
+:INSERT MONITORING.LOAD_CONTROL  (filename, status = LOADED);
+
+|#E6FFFA|DAG: trade_pipeline (*/30 * * * *)|
+:dbt_build — dbt build;
+
+|#FFF5F7|Snowflake TRADE_DB|
+:BRONZE.STG_TRADES
+typed projection of payload,
+filtered to LOAD_CONTROL status = LOADED
+(post-hook flips them to COMPLETED);
+:SILVER.INT_TRADE_SEQUENCE
+window functions rebuild arrival order
+per trade_id;
+:SILVER.INT_TRADE_VALIDATION
+classify ACCEPTED / REJECTED
++ rejection_reason;
+fork
+  :GOLD.TRADE_STORE
+  incremental MERGE on trade_id,
+  keeps version >= stored version,
+  status VALID / EXPIRED;
+fork again
+  :GOLD.REJECTED_TRADES
+  incremental APPEND,
+  audit of lower-version arrivals;
+end fork
+
+|#E6FFFA|DAG: trade_pipeline (*/30 * * * *)|
+:archive_files — data/ -> data/archive/;
+note right
+  Runs last, so a file is archived
+  only after ingest AND dbt succeed.
+  A failure leaves the file in data/
+  for the next run to retry.
+end note
+
+|#FFFAF0|Monitoring & Notification|
+if (pipeline outcome) then (success)
+  :Airflow on_success_callback
+  -> SMTP success email;
+else (task failed)
+  :Airflow email_on_failure
+  -> SMTP failure email naming the task;
+  :MONITORING.V_PIPELINE_HEALTH -> DEGRADED;
+  :ALERT_PIPELINE_FAILURE (suspended by default)
+  -> SYSTEM$SEND_EMAIL via TRADE_ALERT_EMAIL;
+endif
+stop
+
+@enduml

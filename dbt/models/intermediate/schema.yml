@@ -3,8 +3,8 @@ version: 2
 models:
   - name: int_trade_sequence
     description: >
-      Reconstructs arrival order for each trade and derives the state the
-      business rules need. No business rules are applied here.
+      Reconstructs arrival order for each trade within the run and derives the
+      state the business rules need. No business rules are applied here.
     columns:
       - name: surrogate_key
         description: Still one row per RAW row at this layer.
@@ -19,12 +19,14 @@ models:
           - not_null
       - name: prior_version
         description: >
-          Highest version seen for this trade before this record arrived.
-          Null for the first record of a trade.
+          Version of the NEXT arrival for this trade in the same run. Non-null
+          means this record is superseded by a later arrival; null means it is
+          the final arrival, and the one the run acts on.
       - name: previously_established
         description: >
-          1 when an earlier record for this trade had already reached the trade
-          store. Null for the first record of a trade.
+          1 when an earlier arrival for this trade was viable at ingestion time,
+          0 when earlier arrivals existed but none were. Null for the first
+          arrival of a trade.
 
   - name: int_trade_validation
     description: >

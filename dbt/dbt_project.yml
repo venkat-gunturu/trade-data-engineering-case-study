@@ -10,9 +10,6 @@ test-paths: ["tests"]
 
 clean-targets: ["target", "dbt_packages"]
 
-# Folder -> schema mapping. The generate_schema_name override in macros/ makes
-# these land in the schema named literally, instead of dbt's default
-# <target_schema>_<custom_schema> concatenation.
 models:
   trade_pipeline:
     staging:

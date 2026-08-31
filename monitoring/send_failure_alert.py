@@ -1,28 +1,30 @@
-"""Send an email when a task in the trade pipeline fails.
+"""Send a pipeline-failure email through Snowflake, by hand.
 
-Called by the `notify_failure` task in airflow/dags/trade_pipeline.py, which runs
-with trigger_rule="one_failed" and therefore only when an upstream task has
-already failed.
+A standalone CLI. The DAG does NOT call it: trade_pipeline reports failures with
+Airflow's built-in email_on_failure over SMTP. This script is
+the second, independent route - useful when SMTP is unavailable or unconfigured,
+or to prove the Snowflake notification integration works without waiting for a
+pipeline failure.
 
 The email is sent by Snowflake through the TRADE_ALERT_EMAIL notification
-integration created in monitoring/sql/monitoring.sql. Snowflake is the mail
-sender, so the project needs no SMTP server and no external notification service.
+integration created in monitoring/sql/monitoring.sql - the same integration the
+ALERT_PIPELINE_FAILURE data alert uses. The recipient must therefore be a
+VERIFIED email address of a user in the Snowflake account.
 
 Credentials are not handled here. load_env_file() and connect() are imported from
 the loader, so the pipeline has exactly one credential mechanism.
 
-WHY THIS SCRIPT ALWAYS EXITS NON-ZERO
--------------------------------------
-Airflow decides a DAG run's state from its leaf tasks. `notify_failure` is the
-leaf, so if it succeeded the run would be reported as successful even though an
-upstream task had failed. Exiting non-zero keeps the run red, which is the truth.
-The exit code says nothing about whether the email was sent - that is in the log.
-This is the same reasoning behind the "watcher" pattern in Airflow's own system
-test DAGs.
+WHY EVERY EXIT CODE IS NON-ZERO
+-------------------------------
+This script only ever runs because something failed, so "success" would be a
+misleading exit status: a caller that checks $? should see a failure, not a
+report that the failure was successfully described. The codes below distinguish
+only the reason - whether the email went out is in the output, not the code.
 
 Usage:
     python send_failure_alert.py --dag-id trade_pipeline --run-id manual__... \
-                                 --logical-date 2026-08-30
+                                 --logical-date 2026-08-30 \
+                                 --failed-tasks ingest_trades
 """
 
 import argparse
@@ -48,16 +50,31 @@ EXIT_NOT_CONFIGURED = 2
 EXIT_SEND_FAILED = 3
 
 
+def format_failed_tasks(raw):
+    """Normalise the --failed-tasks value into a readable list.
+
+    The DAG passes a comma-separated list read back from the run's own task
+    instances. It can legitimately arrive empty, so an empty value is reported
+    as unknown rather than as "no task failed" - this script only ever runs
+    because something did fail.
+    """
+    tasks = [task.strip() for task in (raw or "").split(",") if task.strip()]
+    return ", ".join(tasks) if tasks else "unknown (see the Airflow UI)"
+
+
 def build_message(args):
     """Return the (subject, body) describing the failed run."""
-    subject = f"Trade pipeline FAILED: {args.dag_id}"
+    failed = format_failed_tasks(getattr(args, "failed_tasks", ""))
+
+    subject = f"Trade pipeline FAILED: {args.dag_id} - {failed}"
     body = (
         f"A task in the {args.dag_id} DAG failed.\n\n"
         f"  DAG            {args.dag_id}\n"
+        f"  Failed task    {failed}\n"
         f"  Run id         {args.run_id}\n"
         f"  Logical date   {args.logical_date}\n\n"
-        "The Airflow UI shows which task failed and its log. For the Snowflake "
-        "side of the same run:\n\n"
+        "The Airflow UI shows the failed task's log. For the Snowflake side of "
+        "the same run:\n\n"
         "  SELECT * FROM TRADE_DB.MONITORING.V_PIPELINE_HEALTH ORDER BY day DESC;\n\n"
         "README section 15 lists the administrative queries that identify the "
         "failing file or dbt node."
@@ -83,6 +100,11 @@ def parse_args(argv=None):
     parser.add_argument("--dag-id", default="trade_pipeline", help="DAG that failed.")
     parser.add_argument("--run-id", default="unknown", help="Airflow run id.")
     parser.add_argument("--logical-date", default="unknown", help="Run's logical date.")
+    parser.add_argument(
+        "--failed-tasks",
+        default="",
+        help="Comma-separated ids of the tasks that failed. The DAG fills this in.",
+    )
     return parser.parse_args(argv)
 
 
@@ -121,8 +143,8 @@ def main(argv=None):
 
     print(f"Failure notification sent to {recipient} via {INTEGRATION}.")
     print(
-        "Exiting non-zero on purpose: this task is the DAG's leaf, and a "
-        "successful leaf would report the failed run as successful."
+        "Exiting non-zero on purpose: this script only runs because something "
+        "failed, so a zero exit status would misreport that failure."
     )
     return EXIT_NOTIFIED
 

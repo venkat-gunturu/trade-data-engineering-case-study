@@ -1,8 +1,14 @@
--- Row-count integrity across the layers. Returns rows only on failure.
+-- Row-count integrity between BRONZE and SILVER. Returns rows only on failure.
 --
---   staged_vs_validated         every staged trade is classified exactly once
---   rejected_vs_audit           every rejected record reaches the audit table
---   store_vs_distinct_accepted  the store holds one row per accepted trade_id
+-- int_trade_validation classifies but never filters, so the audit trail stays
+-- complete: every staged trade must appear exactly once, whether it was accepted
+-- or rejected.
+--
+-- The GOLD counts this test used to make were removed when trade_store became
+-- incremental. They compared a cumulative store against a single run's SILVER
+-- output, which are different populations over different time windows and can
+-- never be expected to match. The GOLD invariants are asserted by the `unique`
+-- test on trade_store.trade_id and by the unit tests in models/marts.
 
 with staged as (
     select count(*) as n from {{ ref('stg_trades') }}
@@ -10,40 +16,11 @@ with staged as (
 
 validated as (
     select count(*) as n from {{ ref('int_trade_validation') }}
-),
-
-accepted as (
-    select count(*) as n
-    from {{ ref('int_trade_validation') }}
-    where validation_status = 'ACCEPTED'
-),
-
-audited as (
-    select count(*) as n from {{ ref('rejected_trades') }}
-),
-
-stored as (
-    select count(*) as n from {{ ref('trade_store') }}
-),
-
-distinct_accepted as (
-    select count(distinct trade_id) as n
-    from {{ ref('int_trade_validation') }}
-    where validation_status = 'ACCEPTED'
 )
 
-select 'staged_vs_validated' as check_name, staged.n as left_value, validated.n as right_value
+select
+    'staged_vs_validated' as check_name,
+    staged.n              as left_value,
+    validated.n           as right_value
 from staged, validated
 where staged.n != validated.n
-
-union all
-
-select 'rejected_vs_audit', validated.n - accepted.n, audited.n
-from validated, accepted, audited
-where validated.n - accepted.n != audited.n
-
-union all
-
-select 'store_vs_distinct_accepted', stored.n, distinct_accepted.n
-from stored, distinct_accepted
-where stored.n != distinct_accepted.n

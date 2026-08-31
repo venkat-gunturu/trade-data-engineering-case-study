@@ -63,3 +63,9 @@ variable "raw_table_name" {
   type        = string
   default     = "RAW_TRADES"
 }
+
+variable "load_control_name" {
+  description = "Manages the load data"
+  type        = string
+  default     = "LOAD_CONTROL"
+}
