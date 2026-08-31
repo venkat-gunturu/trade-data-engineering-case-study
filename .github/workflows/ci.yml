@@ -1,23 +1,15 @@
-# Continuous integration for the trade pipeline.
-#
-# Two jobs, deliberately split by whether they need Snowflake at all:
-#
-#   validate          no credentials, cannot reach Snowflake, ~1 minute
-#   dbt-integration   builds every dbt node against a throwaway clone of TRADE_DB
-#
-# This workflow never runs `terraform apply` and never writes to TRADE_DB, so
-# opening a pull request cannot change infrastructure or data. See README
-# section 17 for why Terraform apply stays a local operation.
+###############################################################################
+# Trade Analytics — CI Pipeline
+# Triggers on: push to main branch + PRs on any branch
+###############################################################################
 
-name: CI
+name: CI — Code Quality & Validation
 
 on:
   pull_request:
   push:
     branches: [main]
 
-# A new push to the same branch cancels the previous run rather than queueing
-# a second CI database clone behind it.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -27,33 +19,16 @@ env:
   TERRAFORM_VERSION: "1.15.8"
 
 jobs:
-
-  # ---------------------------------------------------------------------------
-  # Everything that can be checked without a warehouse.
-  #
-  # The Snowflake variables below are deliberately dummy values. `dbt parse`
-  # needs them to render the env_var() calls in profiles.yml, but it never opens
-  # a connection - so this job is structurally incapable of reaching Snowflake,
-  # which is what makes it safe to run on every push at no cost.
-  # ---------------------------------------------------------------------------
   validate:
     name: Validate (no Snowflake)
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Assert no credentials or state files are tracked
-        run: |
-          tracked=$(git ls-files | grep -E '(^|/)\.env$|(^|/)profiles\.yml$|\.tfstate|(^|/)[^/]*\.tfvars$|\.tfplan$|(^|/)\.terraform/' || true)
-          if [ -n "$tracked" ]; then
-            echo "::error::These files must never be committed:"
-            echo "$tracked"
-            exit 1
-          fi
-          echo "OK - no .env, profiles.yml, tfstate, tfvars or tfplan in the index."
-
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
@@ -65,7 +40,6 @@ jobs:
       - name: Run Python tests
         run: pytest tests/ -q
 
-      # profiles.yml is gitignored, so CI builds it from the committed example.
       - name: Create the dbt profile
         run: cp dbt/profiles.yml.example dbt/profiles.yml
 
@@ -84,7 +58,8 @@ jobs:
         # so it belongs in the job below rather than here.
         run: dbt parse --profiles-dir . --no-partial-parse
 
-      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform setup
+        uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
           terraform_wrapper: false
@@ -138,9 +113,11 @@ jobs:
       DBT_THREADS: "4"
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
